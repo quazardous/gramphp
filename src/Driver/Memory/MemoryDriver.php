@@ -7,6 +7,7 @@ namespace Quazardous\GramPHP\Driver\Memory;
 use Quazardous\GramPHP\Arrival;
 use Quazardous\GramPHP\Driver\CoreDriver;
 use Quazardous\GramPHP\Driver\LaneDriver;
+use Quazardous\GramPHP\Driver\LimitDriver;
 use Quazardous\GramPHP\Driver\NodeTimes;
 use Quazardous\GramPHP\Driver\ReadingDriver;
 use Quazardous\GramPHP\Entry;
@@ -30,7 +31,7 @@ use Quazardous\GramPHP\Time;
  * `candidates` is an ordered iterable of subjects (or `Keyed`): the order is
  * the priority, the first ones are taken first.
  */
-final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDriver
+final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDriver, LimitDriver
 {
     /** @var array<string, array<string, Row>> Subject::key() => node => row, in the order written */
     private array $rows = [];
@@ -46,6 +47,9 @@ final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDr
 
     /** @var array<string, array<string, Arrival>> Subject::key() => lane => arrival waiting */
     private array $waiting = [];
+
+    /** @var array<string, float> limiter state */
+    private array $limits = [];
 
     public function now(): string
     {
@@ -276,6 +280,33 @@ final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDr
     public function progress(int|string $subject): array
     {
         return array_map(static fn(Row $row): string => $row->status, $this->rows[Subject::key($subject)] ?? []);
+    }
+
+    // -- limits ----------------------------------------------------------
+
+    public function limits(array $keys): array
+    {
+        return array_intersect_key($this->limits, array_flip($keys));
+    }
+
+    public function setLimits(array $values): void
+    {
+        $this->limits = $values + $this->limits;
+    }
+
+    public function running(string $name, ?array $policies): int
+    {
+        $count = 0;
+        foreach ($this->rows as $key => $nodes) {
+            if (Status::Running->value !== ($nodes[$name] ?? null)?->status) {
+                continue;
+            }
+            if (null === $policies || \in_array($this->policyOf[$key] ?? null, $policies, true)) {
+                ++$count;
+            }
+        }
+
+        return $count;
     }
 
     // -- lanes -----------------------------------------------------------

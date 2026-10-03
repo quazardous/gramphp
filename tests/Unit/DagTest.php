@@ -8,10 +8,12 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Quazardous\GramPHP\Dag;
 use Quazardous\GramPHP\DagError;
+use Quazardous\GramPHP\Group;
 use Quazardous\GramPHP\Lane;
 use Quazardous\GramPHP\Loop;
 use Quazardous\GramPHP\Merge;
 use Quazardous\GramPHP\Node;
+use Quazardous\GramPHP\Rate;
 use Quazardous\GramPHP\Retry;
 use Quazardous\GramPHP\Status;
 use Quazardous\GramPHP\Tests\Contract\Graphs;
@@ -76,6 +78,12 @@ final class DagTest extends TestCase
         yield 'lane keeping nothing' => [[new Node('a', lane: Lane::batch(maxSize: 0))], 'keeps nothing'];
         yield 'lane zero cooldown' => [[new Node('a', lane: Lane::throttle(0))], 'must last'];
         yield 'lane bad delay' => [[new Node('a', lane: Lane::debounce('soon'))], 'not a duration'];
+        yield 'lane with a concurrency' => [[new Node('a', lane: new Lane(), concurrency: 2)], 'is a lane'];
+        yield 'zero concurrency' => [[new Node('a', concurrency: 0)], 'at least 1'];
+        yield 'wait with a rate' => [[new Node('a'), new Node('b', parents: ['a'], wait: 'e', rate: [new Rate(1, '1m')])], 'takes no rate'];
+        yield 'empty group' => [[new Node('a', group: new Group(0))], 'not a group'];
+        yield 'group on a choice' => [[new Node('a', group: new Group(2), choice: true), new Node('b', parents: ['a'])], 'groups its subjects'];
+        yield 'group zero maxWait' => [[new Node('a', group: new Group(2, maxWait: 0))], 'must last'];
     }
 
     /** @param list<Node> $nodes */
@@ -85,6 +93,21 @@ final class DagTest extends TestCase
         $this->expectException(DagError::class);
         $this->expectExceptionMessage($needle);
         (new Dag(...$nodes))->check();
+    }
+
+    public function testRateBandsAdmitTheirBurstThenTheirPace(): void
+    {
+        $band = new Rate(3, '1m');
+        self::assertSame([3, [60.0]], Rate::admit([$band], [null], 0.0, 10), 'a fresh band lets its burst through');
+        self::assertSame([0, [60.0]], Rate::admit([$band], [60.0], 0.0, 10), 'then nothing');
+        self::assertSame(1, Rate::admit([$band], [60.0], 20.0, 10)[0], 'until one interval has passed');
+        self::assertSame(1, Rate::admit([$band, new Rate(1, '1h')], [null, null], 0.0, 10)[0], 'the tightest band decides');
+    }
+
+    public function testARateRefusesWhatCannotBe(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new Rate(0, '1m');
     }
 
     public function testTheContractGraphsHoldTogether(): void

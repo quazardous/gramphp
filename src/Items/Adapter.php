@@ -80,6 +80,16 @@ abstract class Adapter
         return null;
     }
 
+    /**
+     * What this item is grouped BY, for a node that works subjects together —
+     * a colour, a destination, a customer. Compared, never read. `null` puts
+     * it in no group: a node grouping by key refuses it.
+     */
+    public function groupOf(mixed $item): ?string
+    {
+        return null;
+    }
+
     /** Which branch this item takes out of a `choice` node. */
     public function branch(mixed $item, string $node): ?string
     {

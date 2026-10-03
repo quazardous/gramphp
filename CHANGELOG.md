@@ -24,6 +24,11 @@ follows [Semantic Versioning](https://semver.org/).
 - The MariaDB driver runs over PDO or over a Doctrine DBAL connection
   (`DbalSql`), so a Symfony application can share its own connection and
   transaction; the contract runs on both.
+- Rate limits (`Rate` bands, a generic cell rate algorithm), concurrency
+  caps and `Per::Policy` budgets (`LimitDriver`), decided by the journal under
+  the driver's guard; groups (`Group`): a claim hands out a whole group of
+  subjects sharing a key, or nothing, `maxWait` letting a short one go. A
+  lane's door honours its node's rate. The items layer gains `groupOf`.
 - Lanes (`Lane`, `Node::$lane`, `LaneDriver`): `arrive`, `arrival`, `refs`,
   and `settle` letting due arrivals in, the previous pass archived in the same
   write; throttle, debounce, dedupe and batch presets, `maxWait`,

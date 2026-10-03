@@ -7,6 +7,7 @@ namespace Quazardous\GramPHP\Tests\Driver;
 use Quazardous\GramPHP\Dag;
 use Quazardous\GramPHP\Driver\Memory\MemoryDriver;
 use Quazardous\GramPHP\Driver\Memory\Row;
+use Quazardous\GramPHP\Keyed;
 use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Status;
 use Quazardous\GramPHP\Tests\Contract\Clock;
@@ -23,6 +24,11 @@ final class MemoryHarness implements Harness
     public function candidates(array $subjects): mixed
     {
         return $subjects;
+    }
+
+    public function keyed(array $pairs): mixed
+    {
+        return array_map(static fn(array $pair): Keyed => new Keyed($pair[0], $pair[1]), $pairs);
     }
 
     public function seed(NodeJournal $journal, int|string $subject, array $progress): void

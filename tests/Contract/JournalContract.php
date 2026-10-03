@@ -9,13 +9,16 @@ use PHPUnit\Framework\TestCase;
 use Quazardous\GramPHP\Dag;
 use Quazardous\GramPHP\DagError;
 use Quazardous\GramPHP\Driver\LaneDriver;
+use Quazardous\GramPHP\Group;
 use Quazardous\GramPHP\Lane;
 use Quazardous\GramPHP\Lease;
 use Quazardous\GramPHP\Merge;
 use Quazardous\GramPHP\Node;
 use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Outcome;
+use Quazardous\GramPHP\Per;
 use Quazardous\GramPHP\Position;
+use Quazardous\GramPHP\Rate;
 use Quazardous\GramPHP\Reason;
 use Quazardous\GramPHP\Retry;
 use Quazardous\GramPHP\Status;
@@ -1105,6 +1108,156 @@ abstract class JournalContract extends TestCase
         self::assertTaken([7, $big], $this->claim($journal, 'scrape', [$big, 7]));
     }
 
+    // -- rate and concurrency --------------------------------------------
+
+    public function testConcurrencyCapsWhatRunsAtOnce(): void
+    {
+        $journal = $this->journal(new Dag(new Node('gpu', concurrency: 2)));
+        $first = $this->claim($journal, 'gpu', ['a', 'b', 'c', 'd']);
+        self::assertCount(2, $first);
+        self::assertTaken([], $this->claim($journal, 'gpu', ['a', 'b', 'c', 'd']));
+        $journal->conclude('gpu', [$first->subjects[0]], $first->token);
+        self::assertCount(1, $this->claim($journal, 'gpu', ['a', 'b', 'c', 'd']));
+    }
+
+    public function testRateBandsLetThroughTheirBurstThenTheirPace(): void
+    {
+        $journal = $this->journal(new Dag(new Node('call', rate: [new Rate(3, '1m'), new Rate(4, '1h')])));
+        $subjects = array_map(static fn(int $i): string => "s{$i}", range(0, 9));
+        self::assertCount(3, $this->claim($journal, 'call', $subjects));
+        self::assertTaken([], $this->claim($journal, 'call', $subjects));
+        $this->clock->now = '2026-01-01T00:00:20+00:00';
+        self::assertCount(1, $this->claim($journal, 'call', $subjects), '20 s buys one');
+        $this->clock->now = '2026-01-01T00:05:00+00:00';
+        self::assertTaken([], $this->claim($journal, 'call', $subjects), 'the minute band is full again, the hour band is spent');
+    }
+
+    public function testPerPolicyGivesEachPolicyItsOwnBudget(): void
+    {
+        $journal = $this->journal(new Dag(new Node('call', concurrency: 1, per: Per::Policy)));
+        $journal->enroll(['b1', 'b2', 'b3'], 'big');
+        $journal->enroll(['s1', 's2'], 'small');
+        self::assertTaken(['b1', 's1', 'x'], $this->claim($journal, 'call', ['b1', 'b2', 'b3', 's1', 's2', 'x', 'y']), 'one for big, one for small, one for the subjects without a policy');
+        self::assertTaken([], $this->claim($journal, 'call', ['b2', 's2', 'y']), 'every budget is spent');
+    }
+
+    public function testALaneLetsArrivalsInByPlaceWithinItsRate(): void
+    {
+        $journal = $this->journal(new Dag(
+            new Node('arrive', lane: new Lane(), rate: [new Rate(1, '1m')]),
+            new Node('scrape', parents: ['arrive']),
+            new Node('publish', parents: ['scrape']),
+        ));
+        foreach ([[0, 'c'], [1, 'a'], [2, 'b']] as [$minute, $subject]) {
+            $this->clock->now = self::at($minute);
+            $journal->arrive('arrive', [$subject]);
+        }
+        $this->clock->now = self::at(3);
+        self::assertSame(1, $this->letIn($journal, ['a', 'b', 'c']));
+        self::assertProgress(['arrive' => Status::Done], $journal, 'c', 'c arrived first');
+        self::assertSame(0, $this->letIn($journal, ['a', 'b', 'c']), 'one a minute');
+        $this->clock->now = self::at(4);
+        self::assertSame(1, $this->letIn($journal, ['a', 'b', 'c']));
+        self::assertProgress(['arrive' => Status::Done], $journal, 'a');
+    }
+
+    // -- groups ----------------------------------------------------------
+
+    /** Sorting, then packing three of a colour together. */
+    private static function packing(?Group $group = null): Dag
+    {
+        return new Dag(new Node('sort'), new Node('pack', parents: ['sort'], group: $group ?? new Group(3)));
+    }
+
+    /**
+     * Every brick through `sort`, so `pack` is the only thing left.
+     *
+     * @param array<string, string> $bricks brick => colour
+     */
+    private function sorted(NodeJournal $journal, array $bricks): void
+    {
+        $this->work($journal, 'sort', array_map('strval', array_keys($bricks)));
+    }
+
+    /**
+     * @param array<string, string> $bricks
+     *
+     * @return list<array{0: string, 1: string}>
+     */
+    private static function pairsOf(array $bricks): array
+    {
+        $pairs = [];
+        foreach ($bricks as $brick => $colour) {
+            $pairs[] = [(string) $brick, $colour];
+        }
+
+        return $pairs;
+    }
+
+    public function testANodeGroupingByKeyRefusesACandidateWithoutOne(): void
+    {
+        $journal = $this->journal(new Dag(new Node('pack', group: new Group(2))));
+        self::assertThrows(fn() => $journal->claim('pack', 2, $this->harness->candidates(['a', 'b'])), \InvalidArgumentException::class, 'grampy_key');
+    }
+
+    public function testAGroupGoesWholeOrNotAtAll(): void
+    {
+        $journal = $this->journal(self::packing());
+        $bricks = ['b1' => 'red', 'b2' => 'blue', 'b3' => 'red', 'b4' => 'blue', 'b5' => 'red'];
+        $this->sorted($journal, $bricks);
+        $candidates = $this->harness->keyed(self::pairsOf($bricks));
+        self::assertTaken(['b1', 'b3', 'b5'], $journal->claim('pack', 10, $candidates), 'the three reds went together');
+        self::assertTaken([], $journal->claim('pack', 10, $candidates), 'two blues are not a group of three, and nothing was written for them');
+    }
+
+    public function testAGroupIsOneLeaseOverEveryMember(): void
+    {
+        $journal = $this->journal(self::packing());
+        $bricks = ['b1' => 'red', 'b2' => 'red', 'b3' => 'red'];
+        $this->sorted($journal, $bricks);
+        $lease = $journal->claim('pack', 10, $this->harness->keyed(self::pairsOf($bricks)));
+        self::assertTaken(['b1', 'b2', 'b3'], $lease);
+        self::assertSame(3, $journal->conclude('pack', $lease, $lease->token), 'one token for the group');
+    }
+
+    public function testTwoKeysNeverEndUpInOneGroup(): void
+    {
+        $journal = $this->journal(self::packing());
+        $bricks = ['b1' => 'red', 'b2' => 'blue', 'b3' => 'red', 'b4' => 'blue', 'b5' => 'blue', 'b6' => 'red'];
+        $this->sorted($journal, $bricks);
+        $candidates = $this->harness->keyed(self::pairsOf($bricks));
+        self::assertTaken(['b1', 'b3', 'b6'], $journal->claim('pack', 10, $candidates), 'reds, in the order they were offered');
+        self::assertTaken(['b2', 'b4', 'b5'], $journal->claim('pack', 10, $candidates), 'then blues — never a mixture');
+    }
+
+    public function testMaxWaitLetsAShortGroupGoAsItIs(): void
+    {
+        $journal = $this->journal(self::packing(new Group(3, maxWait: '1h')));
+        $bricks = ['b1' => 'blue', 'b2' => 'blue'];
+        $this->sorted($journal, $bricks);
+        $candidates = $this->harness->keyed(self::pairsOf($bricks));
+        $this->clock->now = self::at(59);
+        self::assertTaken([], $journal->claim('pack', 10, $candidates), 'not yet');
+        $this->clock->now = self::at(61);
+        self::assertTaken(['b1', 'b2'], $journal->claim('pack', 10, $candidates), 'past maxWait an incomplete group goes, and the worker sees its size');
+    }
+
+    public function testWithoutMaxWaitAShortGroupWaitsForEver(): void
+    {
+        $journal = $this->journal(self::packing());
+        $this->sorted($journal, ['b1' => 'pink']);
+        $this->clock->now = self::at(60 * 24 * 365);
+        self::assertTaken([], $journal->claim('pack', 10, $this->harness->keyed([['b1', 'pink']])));
+    }
+
+    public function testAGroupWithoutAKeyTakesAnySubjects(): void
+    {
+        $journal = $this->journal(self::packing(new Group(3, perKey: false)));
+        $bricks = ['b1' => 'red', 'b2' => 'blue', 'b3' => 'green'];
+        $this->sorted($journal, $bricks);
+        self::assertTaken(['b1', 'b2', 'b3'], $journal->claim('pack', 10, $this->harness->keyed(self::pairsOf($bricks))));
+    }
+
     // -- concurrency -----------------------------------------------------
     //
     // SAID IN SESSIONS, NOT IN LOCKS. A session is one unit of work on shared
@@ -1296,6 +1449,91 @@ abstract class JournalContract extends TestCase
                 $waiting = $check->journal()->arrival('s1', 'arrive');
                 $kept = [...self::noted($check->journal(), 's1', Outcome::Entered), ...(null === $waiting ? [] : [$waiting->ref])];
                 self::assertContains('v2', $kept, 'v2 was lost');
+            } finally {
+                $check->rollback();
+            }
+        } finally {
+            $store->close();
+        }
+    }
+
+    public function testAClaimRacingAnotherNeverExceedsTheConcurrency(): void
+    {
+        // One claim takes the whole budget and has not committed yet; a second
+        // claim runs meanwhile. It must not count the budget as free.
+        $store = $this->store(new Dag(new Node('gpu', concurrency: 3)));
+        $subjects = array_map(static fn(int $i): string => \sprintf('s%02d', $i), range(0, 9));
+        try {
+            $first = $store->session();
+            self::assertCount(3, $first->journal()->claim('gpu', 3, $first->candidates(\array_slice($subjects, 0, 5))));
+            $theirs = \array_slice($subjects, 5);
+            self::race(
+                static function () use ($store, $theirs): void {
+                    self::unit($store, static fn(Session $s): Lease => $s->journal()->claim('gpu', 3, $s->candidates($theirs)));
+                },
+                static fn() => $first->commit(),
+            );
+            $check = $store->session();
+            try {
+                self::assertSame(3, $check->journal()->counts('gpu')['running']);
+            } finally {
+                $check->rollback();
+            }
+        } finally {
+            $store->close();
+        }
+    }
+
+    public function testConcurrentClaimersNeverExceedTheConcurrency(): void
+    {
+        $store = $this->store(new Dag(new Node('gpu', concurrency: 3)));
+        $subjects = array_map(static fn(int $i): string => \sprintf('s%02d', $i), range(0, 29));
+        try {
+            $workers = [];
+            for ($i = 0; $i < 4; ++$i) {
+                $workers[] = static function () use ($store, $subjects): void {
+                    for ($round = 0; $round < 8; ++$round) {
+                        self::unit($store, static fn(Session $s): Lease => $s->journal()->claim('gpu', 2, $s->candidates($subjects)));
+                    }
+                };
+            }
+            self::processes($workers);
+            $check = $store->session();
+            try {
+                self::assertSame(3, $check->journal()->counts('gpu')['running']);
+            } finally {
+                $check->rollback();
+            }
+        } finally {
+            $store->close();
+        }
+    }
+
+    public function testTwoClaimersNeverSplitOneGroup(): void
+    {
+        // Both workers see three reds — overlapping, not the same — and both
+        // decide to take them. Only one may end up holding any: a group half
+        // taken is a bag that can never be filled.
+        $store = $this->store(self::packing());
+        try {
+            $setup = $store->session();
+            $lease = $setup->journal()->claim('sort', 4, $setup->candidates(['b1', 'b2', 'b3', 'b4']));
+            $setup->journal()->conclude('sort', $lease, $lease->token);
+            $setup->commit();
+
+            $one = $store->session();
+            $first = $one->journal()->claim('pack', 10, $one->keyed([['b1', 'red'], ['b2', 'red'], ['b3', 'red']]));
+            self::race(
+                static function () use ($store): void {
+                    self::unit($store, static fn(Session $s): Lease => $s->journal()->claim('pack', 10, $s->keyed([['b2', 'red'], ['b3', 'red'], ['b4', 'red']])));
+                },
+                static fn() => $one->commit(),
+            );
+            self::assertCount(3, $first);
+            $check = $store->session();
+            try {
+                $packed = array_values(array_filter(['b1', 'b2', 'b3', 'b4'], static fn(string $b): bool => isset($check->journal()->progress($b)['pack'])));
+                self::assertSame(['b1', 'b2', 'b3'], $packed, 'one whole group, and nothing of a second one');
             } finally {
                 $check->rollback();
             }

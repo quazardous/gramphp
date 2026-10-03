@@ -6,6 +6,7 @@ namespace Quazardous\GramPHP;
 
 use Quazardous\GramPHP\Driver\CoreDriver;
 use Quazardous\GramPHP\Driver\LaneDriver;
+use Quazardous\GramPHP\Driver\LimitDriver;
 use Quazardous\GramPHP\Driver\MissingCapability;
 use Quazardous\GramPHP\Driver\NodeTimes;
 use Quazardous\GramPHP\Driver\ProgressMany;
@@ -97,6 +98,9 @@ final class NodeJournal
             if (null !== $node->lane && !$driver instanceof LaneDriver) {
                 throw new MissingCapability('lane', \sprintf("node '%s', a lane", $node->name), LaneDriver::class);
             }
+            if ($node->limited() && !$driver instanceof LimitDriver) {
+                throw new MissingCapability('limit', \sprintf("node '%s', limited by a rate or a concurrency", $node->name), LimitDriver::class);
+            }
         }
     }
 
@@ -146,27 +150,57 @@ final class NodeJournal
         $after = $this->dag->descendants($name);
         $parents = $requireParents && !$node->customJoin() ? $node->parents : [];
         $now = $this->now();
-        $chosen = [];
-        $seen = [];
-        foreach ($this->driver->scan($candidates, $name, [$name, ...$node->parents, ...$after], $parents, max($limit, self::PAGE), $now, $after) as $page) {
-            foreach ($page as $entry) {
-                $key = Subject::key($entry->subject);
-                if (isset($seen[$key])) {
-                    continue;                 // a subject listed twice counts once
-                }
-                $seen[$key] = true;
-                if (!$this->takable($node, $after, self::dueAway($name, $entry, $now), $requireParents)) {
-                    continue;
-                }
-                $chosen[] = [$entry->subject, $entry->revision];
-                if (\count($chosen) >= $limit) {
-                    break 2;
+        // A GROUP IS GATHERED BEFORE IT IS JUDGED: the claim must read enough
+        // candidates to know whether one is complete, so `limit` alone is not
+        // how far it reads.
+        $enough = null === $node->group ? $limit : max($limit, $node->group->size);
+        $gather = function () use ($node, $name, $candidates, $parents, $after, $enough, $limit, $now, $requireParents): array {
+            $chosen = [];
+            $ready = [];
+            $seen = [];
+            foreach ($this->driver->scan($candidates, $name, [$name, ...$node->parents, ...$after], $parents, max($enough, self::PAGE), $now, $after) as $page) {
+                foreach ($page as $entry) {
+                    $key = Subject::key($entry->subject);
+                    if (isset($seen[$key])) {
+                        continue;                 // a subject listed twice counts once
+                    }
+                    $seen[$key] = true;
+                    if (!$this->takable($node, $after, self::dueAway($name, $entry, $now), $requireParents)) {
+                        continue;
+                    }
+                    if (null !== $node->group) {
+                        $ready[] = $entry;
+
+                        continue;
+                    }
+                    $chosen[] = $entry;
+                    if (\count($chosen) >= $limit) {
+                        return $chosen;
+                    }
                 }
             }
-        }
-        $taken = [] === $chosen
-            ? []
-            : $this->driver->insertIfUnchanged($name, $chosen, Status::Running->value, $now, $token);
+
+            return null === $node->group ? $chosen : $this->group($node, $ready, $now);
+        };
+        $write = function (array $chosen) use ($node, $name, $now, $token): array {
+            /** @var list<Entry> $chosen */
+            if ([] === $chosen) {
+                return [];
+            }
+            $insert = function (array $part) use ($name, $now, $token): array {
+                /** @var list<array{0: int|string, 1: int}> $part */
+                return $this->driver->insertIfUnchanged($name, $part, Status::Running->value, $now, $token);
+            };
+
+            return $node->limited() ? $this->withinLimits($node, $chosen, $now, $insert) : $insert(self::pairs($chosen));
+        };
+        // ONE WRITE PER CLAIM: under contention a claim may take fewer than
+        // `limit`, never a wrong one. A GROUPING CLAIM READS AND WRITES UNDER
+        // THE GUARD of its node, taken before it reads anything: two claimers
+        // would otherwise each win a piece of one group.
+        $taken = null === $node->group
+            ? $write($gather())
+            : $this->driver->guard(["group|{$name}"], static fn(): array => $write($gather()));
 
         return new Lease($taken, $token);
     }
@@ -964,7 +998,8 @@ final class NodeJournal
      * joined, nothing of its previous pass runs, and it is due: urgent, or
      * past both its `delay` (from its place) and its `cooldown` (from the end
      * of the previous pass) — or past `maxWait` from its first arrival
-     * whatever the rest. Due arrivals enter in the order of their places.
+     * whatever the rest. Due arrivals enter in the order of their places,
+     * within the lane's `rate`.
      */
     private function letIn(Node $node, Lane $lane, mixed $candidates, string $now, ?int $limit): int
     {
@@ -1015,12 +1050,20 @@ final class NodeJournal
             $due[] = [$arrival->place, $order[$key], $entry];
         }
         usort($due, static fn(array $a, array $b): int => [$a[0], $a[1]] <=> [$b[0], $b[1]]);
-        $chosen = array_map(static fn(array $d): array => [$d[2]->subject, $d[2]->revision], $due);
+        $chosen = array_map(static fn(array $d): Entry => $d[2], $due);
         if (null !== $limit) {
             $chosen = \array_slice($chosen, 0, $limit);
         }
+        if ([] === $chosen) {
+            return 0;
+        }
+        $enter = static function (array $part) use ($driver, $node, $pass, $now): array {
+            /** @var list<array{0: int|string, 1: int}> $part */
+            return $driver->enter($node->name, $part, $pass, $now);
+        };
 
-        return [] === $chosen ? 0 : \count($driver->enter($node->name, $chosen, $pass, $now));
+        // Due arrivals enter in the order of their places, within the lane's rate.
+        return \count($node->limited() ? $this->withinLimits($node, $chosen, $now, $enter) : $enter(self::pairs($chosen)));
     }
 
     /** @param list<string> $refs */
@@ -1047,6 +1090,136 @@ final class NodeJournal
         }
 
         return $this->driver;
+    }
+
+    /**
+     * THE ONE GROUP THIS CLAIM MAY TAKE, or nothing.
+     *
+     * Candidates keep the order the application gave them, so the group that
+     * goes is the one whose members were offered first. A group goes when it
+     * is FULL, or when its oldest member has been ready longer than `maxWait`
+     * — an incomplete group then goes as it is, and the worker sees how many
+     * it really got.
+     *
+     * @param list<Entry> $ready
+     *
+     * @return list<Entry>
+     */
+    private function group(Node $node, array $ready, string $now): array
+    {
+        $group = $node->group ?? throw new \LogicException('not a grouping node');
+        $gathered = [];
+        foreach ($ready as $entry) {
+            if ($group->perKey && null === $entry->key) {
+                // NO KEY IS NOT ONE KEY: grouping every keyless candidate
+                // together would hand out groups nobody declared.
+                throw new \InvalidArgumentException(\sprintf(
+                    "node '%s' groups by key, and a candidate carries none: name the key column `grampy_key` in SQL, "
+                    . 'pass new Keyed(subject, key) otherwise, or give the items adapter a groupOf',
+                    $node->name,
+                ));
+            }
+            $gathered[$group->perKey ? "k:{$entry->key}" : '*'][] = $entry;
+        }
+        $late = null === $group->maxWait ? null : Time::shift($now, -Time::seconds($group->maxWait));
+        foreach ($gathered as $members) {
+            if (\count($members) >= $group->size) {
+                return \array_slice($members, 0, $group->size);
+            }
+            // AN INCOMPLETE GROUP GOES ONLY WHEN IT HAS WAITED. A node with no
+            // parents has no clock, so no way to be late.
+            $oldest = null;
+            foreach ($members as $member) {
+                $at = self::readyAt($node, $member);
+                if (null !== $at && (null === $oldest || strcmp($at, $oldest) < 0)) {
+                    $oldest = $at;
+                }
+            }
+            if (null !== $late && null !== $oldest && strcmp($oldest, $late) <= 0) {
+                return $members;
+            }
+        }
+
+        return [];
+    }
+
+    /**
+     * RATE AND CONCURRENCY, decided here, kept by the storage's guard.
+     *
+     * Candidates are grouped by budget — one for the node, or one per policy
+     * with `Per::Policy`. Under the guard of every budget's keys, each group is
+     * cut to what `concurrency` leaves free and what the rate bands let
+     * through (`Rate::admit()`), written by `write` — a claim, or a lane
+     * letting subjects in — and the bands advance by what was actually written.
+     *
+     * @param list<Entry>                                                    $chosen
+     * @param callable(list<array{0: int|string, 1: int}>): list<int|string> $write
+     *
+     * @return list<int|string>
+     */
+    private function withinLimits(Node $node, array $chosen, string $now, callable $write): array
+    {
+        $driver = $this->driver instanceof LimitDriver
+            ? $this->driver
+            : throw new MissingCapability('limit', \sprintf("node '%s'", $node->name), LimitDriver::class);
+        /** @var array<string, array{policy: ?string, entries: list<Entry>, bands: list<string>}> $budgets */
+        $budgets = [];
+        foreach ($chosen as $entry) {
+            $policy = Per::Policy === $node->per ? $entry->policy : null;
+            $id = null === $policy ? '*' : "p:{$policy}";
+            if (!isset($budgets[$id])) {
+                $prefix = "{$node->name}|{$id}";
+                $budgets[$id] = ['policy' => $policy, 'entries' => [], 'bands' => array_map(static fn(int $i): string => "rate|{$prefix}|{$i}", array_keys($node->rate))];
+            }
+            $budgets[$id]['entries'][] = $entry;
+        }
+        ksort($budgets, \SORT_STRING);
+        $guarded = [];
+        foreach ($budgets as $id => $budget) {
+            array_push($guarded, ...$budget['bands']);
+            $guarded[] = "running|{$node->name}|{$id}";
+        }
+        $instant = Time::epoch($now);
+
+        return $this->driver->guard($guarded, function () use ($driver, $node, $budgets, $instant, $write): array {
+            $stored = $driver->limits(array_merge(...array_values(array_map(static fn(array $b): array => $b['bands'], $budgets))));
+            $taken = [];
+            $advanced = [];
+            foreach ($budgets as $budget) {
+                $allowed = \count($budget['entries']);
+                if (null !== $node->concurrency) {
+                    $busy = $driver->running($node->name, Per::Policy === $node->per ? [$budget['policy']] : null);
+                    $allowed = min($allowed, max(0, $node->concurrency - $busy));
+                }
+                $tats = array_map(static fn(string $k): ?float => $stored[$k] ?? null, $budget['bands']);
+                if ([] !== $node->rate) {
+                    [$allowed] = Rate::admit($node->rate, $tats, $instant, $allowed);
+                }
+                $written = $allowed > 0 ? $write(self::pairs(\array_slice($budget['entries'], 0, $allowed))) : [];
+                array_push($taken, ...$written);
+                if ([] !== $node->rate) {
+                    [, $moved] = Rate::admit($node->rate, $tats, $instant, \count($written));
+                    foreach ($budget['bands'] as $i => $band) {
+                        $advanced[$band] = $moved[$i];
+                    }
+                }
+            }
+            if ([] !== $advanced) {
+                $driver->setLimits($advanced);
+            }
+
+            return $taken;
+        });
+    }
+
+    /**
+     * @param list<Entry> $entries
+     *
+     * @return list<array{0: int|string, 1: int}>
+     */
+    private static function pairs(array $entries): array
+    {
+        return array_map(static fn(Entry $e): array => [$e->subject, $e->revision], $entries);
     }
 
     /** @param string $why what needs the reading capability */

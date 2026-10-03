@@ -6,6 +6,7 @@ namespace Quazardous\GramPHP\Tests\Unit;
 
 use PHPUnit\Framework\TestCase;
 use Quazardous\GramPHP\Driver\Memory\MemoryDriver;
+use Quazardous\GramPHP\Group;
 use Quazardous\GramPHP\Items\Adapter;
 use Quazardous\GramPHP\Items\ItemLease;
 use Quazardous\GramPHP\Items\Items;
@@ -221,6 +222,25 @@ final class ItemsTest extends TestCase
         self::assertSame(['queued' => 3, 'merged' => 0, 'skipped' => 0], $items->arrive('arrive', $stamps->all()), 'three refs, three groups, three arrivals');
         self::assertSame('v2', $items->journal->arrival(2, 'arrive')?->ref);
         self::assertSame(['queued' => 0, 'merged' => 1, 'skipped' => 0], $items->arrive('arrive', [new Brick(2)]));
+    }
+
+    public function testAGroupingNodeAsksTheAdapterWhatAnItemIsGroupedBy(): void
+    {
+        $colours = new class extends Adapter {
+            public function idOf(mixed $candidate): int
+            {
+                return Bricks::brick($candidate)->id;
+            }
+
+            public function groupOf(mixed $item): string
+            {
+                return Bricks::brick($item)->crate;
+            }
+        };
+        $items = new Items(new NodeJournal(new MemoryDriver(), [new Node('pack', group: new Group(2))]), $colours);
+        $bricks = [new Brick(1, 'red'), new Brick(2, 'blue'), new Brick(3, 'red')];
+        self::assertSame([1, 3], array_map(static fn(mixed $b): int => Bricks::brick($b)->id, $items->claim('pack', 10, $bricks)->items), 'the two reds, objects back');
+        self::assertSame([], $items->claim('pack', 10, $bricks)->items, 'one blue is not a pair');
     }
 
     public function testATokenMayComeWithoutTheLease(): void

@@ -444,8 +444,46 @@ final class Dag implements \IteratorAggregate, \Countable
         if (null !== $node->grace && !$node->optional) {
             throw new DagError(\sprintf("node '%s': grace skips an optional node — this one is not", $node->name));
         }
+        if (null !== $node->concurrency && $node->concurrency < 1) {
+            throw new DagError(\sprintf("node '%s': concurrency %d — at least 1", $node->name, $node->concurrency));
+        }
+        if (null !== $node->wait && $node->limited()) {
+            throw new DagError(\sprintf("node '%s' waits: it is never claimed, so it takes no rate or concurrency", $node->name));
+        }
         if (null !== $node->lane) {
             $this->checkLane($node, $node->lane);
+        }
+        if (null !== $node->group) {
+            $this->checkGroup($node, $node->group);
+        }
+    }
+
+    /**
+     * A group gathers subjects a worker takes together; it cannot sit on a
+     * node no worker claims, nor on one that concludes by naming a branch.
+     */
+    private function checkGroup(Node $node, Group $group): void
+    {
+        if ($group->size < 1) {
+            throw new DagError(\sprintf("node '%s': group size=%d — a group of fewer than one subject is not a group", $node->name, $group->size));
+        }
+        if (null !== $group->maxWait) {
+            try {
+                $seconds = Time::seconds($group->maxWait);
+            } catch (\InvalidArgumentException $e) {
+                throw new DagError(\sprintf("node '%s': group maxWait %s — %s", $node->name, var_export($group->maxWait, true), $e->getMessage()), 0, $e);
+            }
+            if ($seconds <= 0) {
+                throw new DagError(\sprintf("node '%s': group maxWait %s — a duration must last", $node->name, var_export($group->maxWait, true)));
+            }
+        }
+        $unfit = array_keys(array_filter(['wait' => null !== $node->wait, 'lane' => null !== $node->lane, 'choice' => $node->choice]));
+        if ([] !== $unfit) {
+            throw new DagError(\sprintf(
+                "node '%s' groups its subjects, so a worker takes them together: it cannot also take [%s]",
+                $node->name,
+                implode(', ', $unfit),
+            ));
         }
     }
 
@@ -487,6 +525,7 @@ final class Dag implements \IteratorAggregate, \Countable
             'lease' => null !== $node->lease,
             'grace' => null !== $node->grace,
             'optional' => $node->optional,
+            'concurrency' => null !== $node->concurrency,
         ]));
         if ([] !== $unfit) {
             throw new DagError(\sprintf(

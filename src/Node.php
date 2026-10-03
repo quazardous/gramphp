@@ -43,6 +43,14 @@ namespace Quazardous\GramPHP;
  * - `grace` gives an optional node that long, once its parents concluded,
  *   before `$journal->settle()` skips it.
  *
+ * LIMITS — what the node uses, protected:
+ *
+ * - `rate` (bands of `Rate`) and `concurrency`: a claim takes no more than
+ *   the bands let through, nor more than `concurrency` rows running at once.
+ *   `per: Per::Policy` gives each policy its own budget; `Per::All` shares one.
+ * - `group` (`Group`): the claim hands out a whole group of subjects sharing a
+ *   key, under one lease, or none.
+ *
  * `lane` makes the node a WAY IN for subjects that come back (`Lane`): no
  * worker claims it; `$journal->arrive()` puts a subject in it,
  * `$journal->settle()` lets it through, and each pass through what follows is
@@ -56,9 +64,13 @@ final readonly class Node
     /** @var array<string, list<string>> parent => statuses accepted */
     public array $on;
 
+    /** @var list<Rate> */
+    public array $rate;
+
     /**
      * @param array<string>                      $parents
      * @param array<string, array<Status|string>> $on
+     * @param array<Rate>                         $rate
      */
     public function __construct(
         public string $name,
@@ -77,13 +89,24 @@ final readonly class Node
         public int|float|string|null $timeout = null,
         public int|float|string|null $grace = null,
         public ?Lane $lane = null,
+        array $rate = [],
+        public ?int $concurrency = null,
+        public Per $per = Per::All,
+        public ?Group $group = null,
     ) {
+        $this->rate = array_values($rate);
         $this->parents = array_values($parents);
         $edges = [];
         foreach ($on as $parent => $statuses) {
             $edges[(string) $parent] = array_values(array_map(Status::valueOf(...), $statuses));
         }
         $this->on = $edges;
+    }
+
+    /** True when a claim on this node is cut by a rate or a concurrency. */
+    public function limited(): bool
+    {
+        return [] !== $this->rate || null !== $this->concurrency;
     }
 
     /** True when the node joins otherwise than "every parent satisfying". */

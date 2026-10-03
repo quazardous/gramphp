@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Quazardous\GramPHP\Items;
 
+use Quazardous\GramPHP\Keyed;
 use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Status;
 use Quazardous\GramPHP\Subject;
@@ -121,7 +122,7 @@ final class Items
      */
     public function claim(string $name, int $limit, mixed $candidates): ItemLease
     {
-        [$given, $candidates] = $this->subjects($candidates);
+        [$given, $candidates] = $this->subjects($candidates, null !== $this->journal->dag->node($name)->group);
         $lease = $this->journal->claim($name, $limit, $candidates);
         // Objects handed in travel with the claim; anything known only by its
         // id is loaded, exactly as a driver's query would be.
@@ -315,9 +316,13 @@ final class Items
      * stay in hand; anything not iterable — a driver's query — travels on
      * untouched.
      *
+     * A NODE THAT GROUPS gets `Keyed(id, key)` instead, the key coming from
+     * `groupOf` — the one place the application says what makes two subjects
+     * belong together.
+     *
      * @return array{array<string, mixed>, mixed}
      */
-    private function subjects(mixed $candidates): array
+    private function subjects(mixed $candidates, bool $grouping = false): array
     {
         if (!is_iterable($candidates)) {
             return [[], $candidates];
@@ -329,7 +334,7 @@ final class Items
             $id = $this->adapter->idOf($item);
             $key = Subject::key($id);
             if (!\array_key_exists($key, $given)) {
-                $ids[] = $id;
+                $ids[] = $grouping ? new Keyed($id, $this->adapter->groupOf($item)) : $id;
             }
             $given[$key] = $item;
         }

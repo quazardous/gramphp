@@ -110,6 +110,30 @@ final class MariadbHarness implements Harness
         return new Query("SELECT s FROM ({$rows}) c ORDER BY o", $params);
     }
 
+    public function keyed(array $pairs): mixed
+    {
+        return self::orderedKeyed($pairs);
+    }
+
+    /**
+     * An ordered SELECT over literal values, the key in `grampy_key`.
+     *
+     * @param list<array{0: int|string, 1: ?string}> $pairs
+     */
+    public static function orderedKeyed(array $pairs): Query
+    {
+        if ([] === $pairs) {
+            return new Query('SELECT 1 FROM DUAL WHERE FALSE');
+        }
+        $rows = implode(' UNION ALL ', array_fill(0, \count($pairs), 'SELECT ? AS s, ? AS k, ? AS o'));
+        $params = [];
+        foreach ($pairs as $i => [$subject, $key]) {
+            array_push($params, $subject, $key, $i);
+        }
+
+        return new Query("SELECT s, k AS grampy_key FROM ({$rows}) c ORDER BY o", $params);
+    }
+
     public function seed(NodeJournal $journal, int|string $subject, array $progress): void
     {
         ['db' => $db, 'tables' => $tables] = $this->of[$journal] ?? throw new \LogicException('not a journal of this harness');
@@ -162,6 +186,11 @@ final class MariadbHarness implements Harness
                     public function candidates(array $subjects): mixed
                     {
                         return MariadbHarness::ordered($subjects);
+                    }
+
+                    public function keyed(array $pairs): mixed
+                    {
+                        return MariadbHarness::orderedKeyed($pairs);
                     }
 
                     public function commit(): void

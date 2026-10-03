@@ -14,6 +14,9 @@ interface Session
     /** @param list<int|string> $subjects */
     public function candidates(array $subjects): mixed;
 
+    /** @param list<array{0: int|string, 1: ?string}> $pairs [subject, key] */
+    public function keyed(array $pairs): mixed;
+
     public function commit(): void;
 
     public function rollback(): void;

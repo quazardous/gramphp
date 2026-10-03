@@ -31,6 +31,13 @@ interface Harness
     public function candidates(array $subjects): mixed;
 
     /**
+     * The driver's candidates carrying a grouping key, in this order.
+     *
+     * @param list<array{0: int|string, 1: ?string}> $pairs [subject, key]
+     */
+    public function keyed(array $pairs): mixed;
+
+    /**
      * Write rows directly, bypassing the API — progresses the API could not reach included.
      *
      * @param array<string, Status> $progress

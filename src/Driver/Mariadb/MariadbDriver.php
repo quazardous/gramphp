@@ -7,6 +7,7 @@ namespace Quazardous\GramPHP\Driver\Mariadb;
 use Quazardous\GramPHP\Arrival;
 use Quazardous\GramPHP\Driver\CoreDriver;
 use Quazardous\GramPHP\Driver\LaneDriver;
+use Quazardous\GramPHP\Driver\LimitDriver;
 use Quazardous\GramPHP\Driver\NodeTimes;
 use Quazardous\GramPHP\Driver\ProgressMany;
 use Quazardous\GramPHP\Driver\ReadingDriver;
@@ -73,7 +74,7 @@ use Quazardous\GramPHP\Time;
  * (a BIGINT column) or `'string'` (VARCHAR), and every subject read from the
  * tables is returned in that type.
  */
-final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, ProgressMany, LaneDriver
+final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, ProgressMany, LaneDriver, LimitDriver
 {
     /** Values bound per statement, at most. */
     private const CHUNK = 500;
@@ -513,6 +514,57 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
         }
 
         return $block();
+    }
+
+    // -- limits ----------------------------------------------------------
+
+    public function limits(array $keys): array
+    {
+        $out = [];
+        foreach (array_chunk($keys, self::CHUNK) as $chunk) {
+            $rows = $this->sql->select(
+                "SELECT `key`, value FROM {$this->limits} WHERE value IS NOT NULL AND `key` IN (" . self::marks($chunk) . ')',
+                $chunk,
+            );
+            foreach ($rows as [$key, $value]) {
+                $out[self::text($key)] = \is_numeric($value) ? (float) $value : throw new \UnexpectedValueException('a non-numeric limit');
+            }
+        }
+
+        return $out;
+    }
+
+    public function setLimits(array $values): void
+    {
+        $this->requireTransaction();
+        foreach ($values as $key => $value) {
+            $this->sql->execute(
+                "INSERT INTO {$this->limits} (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
+                [(string) $key, $value],
+            );
+        }
+    }
+
+    /** Read under the journal's guard: what committed claims hold. */
+    public function running(string $name, ?array $policies): int
+    {
+        $sql = "SELECT COUNT(*) FROM {$this->table} t LEFT JOIN {$this->revisions} r ON r.{$this->subject} = t.{$this->subject} "
+            . 'WHERE t.node = ? AND t.status = ?';
+        $params = [$name, Status::Running->value];
+        if (null !== $policies) {
+            $named = array_values(array_filter($policies, static fn(?string $p): bool => null !== $p));
+            $any = [];
+            if ([] !== $named) {
+                $any[] = 'r.policy IN (' . self::marks($named) . ')';
+                array_push($params, ...$named);
+            }
+            if (\in_array(null, $policies, true)) {
+                $any[] = 'r.policy IS NULL';
+            }
+            $sql .= ' AND (' . ([] === $any ? 'FALSE' : implode(' OR ', $any)) . ')';
+        }
+
+        return self::integer($this->scalar($sql, $params));
     }
 
     // -- lanes -----------------------------------------------------------

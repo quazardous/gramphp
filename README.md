@@ -100,6 +100,29 @@ A transaction mixing several claims and forgets on the same subjects can
 meet a deadlock: InnoDB reports it (error 1213, SQLSTATE 40001), rolls the
 transaction back, and the caller retries it — nothing is ever half-written.
 
+## Limits and groups
+
+What a node uses is protected where the claim is decided:
+
+```php
+use Quazardous\GramPHP\Group;
+use Quazardous\GramPHP\Per;
+use Quazardous\GramPHP\Rate;
+
+new Node('call', rate: [new Rate(100, '1m'), new Rate(1000, '1h')]);   // bands, all apply
+new Node('gpu', concurrency: 3);                                         // at most 3 running
+new Node('api', concurrency: 1, per: Per::Policy);                       // one budget per policy
+new Node('pack', parents: ['sort'], group: new Group(5, maxWait: '1h')); // five of a key, one lease
+```
+
+A rate band is a generic cell rate algorithm: `limit` per `period`, spread
+evenly, up to `burst` at once. A claim takes no more than the bands and the
+cap let through; under contention it takes fewer, never too many — the
+driver's `guard` holds the read and the write together. A grouping claim
+hands out a whole group of subjects sharing a key (`grampy_key` in SQL,
+`Keyed` otherwise) or nothing; past `maxWait` an incomplete group goes as it
+is. A lane's door honours its node's `rate` too.
+
 ## Lanes: subjects that come back
 
 A subject often comes back — a listing updated again, a file re-uploaded.
@@ -187,15 +210,15 @@ could take now) and `oldest_ready` (starvation).
 
 Ported so far: the graph and its claim rule, joins (`on`, `need`), choices,
 loops, retries, leases, waits and signals, grace, skip, adopt, forget,
-release, the history, counts, stages and snapshots, lanes (throttle,
-debounce, dedupe, batch, merge functions) and the items layer — with the
+release, the history, counts, stages and snapshots, rate limits,
+concurrency caps and groups, lanes (throttle, debounce, dedupe, batch, merge
+functions) and the items layer — with the
 memory and MariaDB drivers, both certified by the shared contract,
 concurrency included.
 
-Still to port from grampy: groups, rate limits and concurrency caps (a
-lane's door gains its `rate` with them), policies (a policy tuning a lane
-with them), graph versions and migration, and the diagram. The items layer
-gains `groupOf` with groups.
+Still to port from grampy: policies (a policy tuning a node's retry, lease,
+grace, rate, concurrency or lane), graph versions and migration, and the
+diagram.
 
 ## Development
 
