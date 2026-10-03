@@ -19,5 +19,8 @@ follows [Semantic Versioning](https://semver.org/).
   `snapshot`.
 - Declared retries (`Retry`: constant, linear or exponential backoff, cap,
   jitter), leases, waits on signals with a timeout, grace on optional nodes.
-- The memory driver and the MariaDB driver (PDO, READ COMMITTED), both
+- The memory driver and the MariaDB driver (READ COMMITTED), both
   certified by the shared driver contract, concurrency included.
+- The MariaDB driver runs over PDO or over a Doctrine DBAL connection
+  (`DbalSql`), so a Symfony application can share its own connection and
+  transaction; the contract runs on both.

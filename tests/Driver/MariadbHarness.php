@@ -17,22 +17,24 @@ use Quazardous\GramPHP\Tests\Contract\Store;
 /**
  * Each journal gets tables of its own — names unique per process and test —
  * dropped when the harness closes. Every connection runs READ COMMITTED,
- * inside a transaction.
+ * inside a transaction, over PDO or Doctrine DBAL.
  */
 final class MariadbHarness implements Harness
 {
     private static int $counter = 0;
 
-    /** @var list<\PDO> */
+    /** @var list<TestDb> */
     private array $open = [];
 
     /** @var list<array<string, string>> table sets to drop */
     private array $tables = [];
 
-    /** @var \WeakMap<NodeJournal, array{pdo: \PDO, tables: array<string, string>}> */
+    /** @var \WeakMap<NodeJournal, array{db: TestDb, tables: array<string, string>}> */
     private \WeakMap $of;
 
+    /** @param 'pdo'|'dbal' $mode */
     public function __construct(
+        private readonly string $mode,
         private readonly string $dsn,
         private readonly string $user,
         private readonly string $password,
@@ -40,12 +42,9 @@ final class MariadbHarness implements Harness
         $this->of = new \WeakMap();
     }
 
-    public function connect(): \PDO
+    public function connect(): TestDb
     {
-        $pdo = new \PDO($this->dsn, $this->user, $this->password, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
-        $pdo->exec('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED');
-
-        return $pdo;
+        return TestDb::connect($this->mode, $this->dsn, $this->user, $this->password);
     }
 
     /**
@@ -57,9 +56,9 @@ final class MariadbHarness implements Harness
     {
         $prefix = \sprintf('g%d_%d', getmypid(), ++self::$counter);
         $tables = ['table' => "{$prefix}_nodes", 'revisions' => "{$prefix}_rev", 'history' => "{$prefix}_hist", 'limits' => "{$prefix}_lim"];
-        $pdo = $this->connect();
+        $db = $this->connect();
         foreach (MariadbDriver::schema($subjectType, ...$tables) as $statement) {
-            $pdo->exec($statement);
+            $db->exec($statement);
         }
         $this->tables[] = $tables;
 
@@ -70,19 +69,19 @@ final class MariadbHarness implements Harness
      * @param array<string, string> $tables
      * @param 'int'|'string'        $subjectType
      */
-    public static function driver(\PDO $pdo, array $tables, string $subjectType): MariadbDriver
+    public static function driver(TestDb $db, array $tables, string $subjectType): MariadbDriver
     {
-        return new MariadbDriver($pdo, $subjectType, $tables['table'], $tables['revisions'], $tables['history'], $tables['limits']);
+        return new MariadbDriver($db->sql(), $subjectType, $tables['table'], $tables['revisions'], $tables['history'], $tables['limits']);
     }
 
     public function journal(Dag $dag, callable $clock, string $subjectType = 'string'): NodeJournal
     {
         $tables = $this->createTables($subjectType);
-        $pdo = $this->connect();
-        $pdo->beginTransaction();
-        $this->open[] = $pdo;
-        $journal = new NodeJournal(self::driver($pdo, $tables, $subjectType), $dag, $clock);
-        $this->of[$journal] = ['pdo' => $pdo, 'tables' => $tables];
+        $db = $this->connect();
+        $db->begin();
+        $this->open[] = $db;
+        $journal = new NodeJournal(self::driver($db, $tables, $subjectType), $dag, $clock);
+        $this->of[$journal] = ['db' => $db, 'tables' => $tables];
 
         return $journal;
     }
@@ -113,10 +112,12 @@ final class MariadbHarness implements Harness
 
     public function seed(NodeJournal $journal, int|string $subject, array $progress): void
     {
-        ['pdo' => $pdo, 'tables' => $tables] = $this->of[$journal] ?? throw new \LogicException('not a journal of this harness');
-        $insert = $pdo->prepare("INSERT INTO {$tables['table']} (subject, node, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?)");
+        ['db' => $db, 'tables' => $tables] = $this->of[$journal] ?? throw new \LogicException('not a journal of this harness');
         foreach ($progress as $name => $status) {
-            $insert->execute([$subject, (string) $name, $status->value, Clock::T0, Status::Running === $status ? null : Clock::T0]);
+            $db->exec(
+                "INSERT INTO {$tables['table']} (subject, node, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?)",
+                [$subject, (string) $name, $status->value, Clock::T0, Status::Running === $status ? null : Clock::T0],
+            );
         }
     }
 
@@ -144,12 +145,14 @@ final class MariadbHarness implements Harness
 
             public function session(): Session
             {
-                $pdo = $this->harness->connect();
-                $pdo->beginTransaction();
-                $journal = new NodeJournal(MariadbHarness::driver($pdo, $this->tables, 'string'), $this->dag, $this->clock);
+                $db = $this->harness->connect();
+                $db->begin();
+                $journal = new NodeJournal(MariadbHarness::driver($db, $this->tables, 'string'), $this->dag, $this->clock);
 
-                return new class ($pdo, $journal) implements Session {
-                    public function __construct(private ?\PDO $pdo, private readonly NodeJournal $journal) {}
+                return new class ($db, $journal) implements Session {
+                    private bool $ended = false;
+
+                    public function __construct(private readonly TestDb $db, private readonly NodeJournal $journal) {}
 
                     public function journal(): NodeJournal
                     {
@@ -163,38 +166,62 @@ final class MariadbHarness implements Harness
 
                     public function commit(): void
                     {
-                        $this->pdo?->commit();
-                        $this->pdo = null;
+                        if (!$this->ended) {
+                            $this->db->commit();
+                            $this->ended = true;
+                        }
                     }
 
                     public function rollback(): void
                     {
-                        $this->pdo?->rollBack();
-                        $this->pdo = null;
+                        if (!$this->ended) {
+                            $this->db->rollback();
+                            $this->ended = true;
+                        }
                     }
                 };
+            }
+
+            public function retryable(\Throwable $e): bool
+            {
+                return MariadbHarness::isDeadlock($e);
             }
 
             public function close(): void {}
         };
     }
 
+    /** A deadlock or lock conflict InnoDB asks to retry: SQLSTATE 40001, error 1213. */
+    public static function isDeadlock(\Throwable $e): bool
+    {
+        for ($cause = $e; null !== $cause; $cause = $cause->getPrevious()) {
+            if ($cause instanceof \Doctrine\DBAL\Exception\RetryableException) {
+                return true;
+            }
+            if ($cause instanceof \PDOException && ('40001' === (string) $cause->getCode() || 1213 === ($cause->errorInfo[1] ?? null))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public function close(): void
     {
-        foreach ($this->open as $pdo) {
+        foreach ($this->open as $db) {
             try {
-                if ($pdo->inTransaction()) {
-                    $pdo->rollBack();
+                if ($db->inTransaction()) {
+                    $db->rollback();
                 }
-            } catch (\PDOException) {
+            } catch (\Throwable) {
                 // a connection the test broke
             }
         }
         $this->open = [];
         if ([] !== $this->tables) {
-            $pdo = $this->connect();
+            $db = $this->connect();
             foreach ($this->tables as $tables) {
-                $pdo->exec('DROP TABLE IF EXISTS ' . implode(', ', $tables));
+                $db->exec('DROP TABLE IF EXISTS ' . implode(', ', $tables));
             }
             $this->tables = [];
         }

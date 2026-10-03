@@ -825,9 +825,7 @@ abstract class JournalContract extends TestCase
             }
             self::race(
                 static function () use ($store): void {
-                    $worker = $store->session();
-                    $worker->journal()->claim('left', 1, $worker->candidates(['s1']));
-                    $worker->commit();
+                    self::unit($store, static fn(Session $s): Lease => $s->journal()->claim('left', 1, $s->candidates(['s1'])));
                 },
                 static fn() => $requeue->commit(),
             );
@@ -850,9 +848,7 @@ abstract class JournalContract extends TestCase
                 $workers[] = static function () use ($store, $order): array {
                     $taken = [];
                     while (true) {
-                        $session = $store->session();
-                        $got = $session->journal()->claim('start', 7, $session->candidates($order));
-                        $session->commit();
+                        $got = self::unit($store, static fn(Session $s): Lease => $s->journal()->claim('start', 7, $s->candidates($order)));
                         if ($got->isEmpty()) {
                             return $taken;
                         }
@@ -875,12 +871,12 @@ abstract class JournalContract extends TestCase
         try {
             $janitor = static function () use ($store, $subjects): void {
                 for ($round = 0; $round < 15; ++$round) {
-                    $session = $store->session();
                     $chosen = array_values(array_filter($subjects, static fn(int $k): bool => $k % 3 === $round % 3, \ARRAY_FILTER_USE_KEY));
-                    foreach (['start', 'left', 'right', 'end'] as $name) {
-                        $session->journal()->forget($name, $chosen);
-                    }
-                    $session->commit();
+                    self::unit($store, static function (Session $s) use ($chosen): void {
+                        foreach (['start', 'left', 'right', 'end'] as $name) {
+                            $s->journal()->forget($name, $chosen);
+                        }
+                    });
                 }
             };
             self::processes([self::claimer($store, ['start', 'left'], $subjects), self::claimer($store, ['right', 'end'], $subjects), self::claimer($store, ['left', 'end', 'start'], $subjects), $janitor]);
@@ -891,6 +887,42 @@ abstract class JournalContract extends TestCase
     }
 
     // -- concurrency helpers ---------------------------------------------
+
+    /**
+     * ONE UNIT OF WORK on a fresh session, committed. A transient conflict the
+     * storage reports — a deadlock between transactions mixing claims and
+     * forgets on the same subjects — is retried, as an application retries
+     * its transaction: the guarantees under test are about what is written,
+     * never about whether a database may ask to try again.
+     *
+     * @template T
+     *
+     * @param callable(Session): T $work
+     *
+     * @return T
+     */
+    private static function unit(Store $store, callable $work): mixed
+    {
+        for ($attempt = 1; ; ++$attempt) {
+            $session = $store->session();
+            try {
+                $result = $work($session);
+                $session->commit();
+
+                return $result;
+            } catch (\Throwable $e) {
+                try {
+                    $session->rollback();
+                } catch (\Throwable) {
+                    // the storage already rolled it back
+                }
+                if ($attempt >= 20 || !$store->retryable($e)) {
+                    throw $e;
+                }
+                usleep(random_int(1_000, 20_000));
+            }
+        }
+    }
 
     /**
      * A worker claiming and concluding `names`, round after round.
@@ -905,10 +937,10 @@ abstract class JournalContract extends TestCase
         return static function () use ($store, $names, $subjects): void {
             for ($round = 0; $round < 15; ++$round) {
                 foreach ($names as $name) {
-                    $session = $store->session();
-                    $got = $session->journal()->claim($name, 3, $session->candidates($subjects));
-                    $session->journal()->conclude($name, $got, $got->token);
-                    $session->commit();
+                    self::unit($store, static function (Session $s) use ($name, $subjects): void {
+                        $got = $s->journal()->claim($name, 3, $s->candidates($subjects));
+                        $s->journal()->conclude($name, $got, $got->token);
+                    });
                 }
             }
         };

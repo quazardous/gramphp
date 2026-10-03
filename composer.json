@@ -3,15 +3,27 @@
     "description": "A small workflow graph for work queues that already live in a storage: nodes, joins, retries, leases — over pluggable drivers (memory, MariaDB). A PHP port of grampy.",
     "type": "library",
     "license": "MIT",
-    "keywords": ["workflow", "dag", "queue", "journal", "lease", "retry", "mariadb"],
+    "keywords": [
+        "workflow",
+        "dag",
+        "queue",
+        "journal",
+        "lease",
+        "retry",
+        "mariadb"
+    ],
     "homepage": "https://github.com/quazardous/gramphp",
     "authors": [
-        {"name": "David Berlioz", "homepage": "https://github.com/quazardous"}
+        {
+            "name": "David Berlioz",
+            "homepage": "https://github.com/quazardous"
+        }
     ],
     "require": {
         "php": ">=8.2"
     },
     "require-dev": {
+        "doctrine/dbal": "^4.0",
         "ext-pdo": "*",
         "friendsofphp/php-cs-fixer": "^3.64",
         "phpstan/phpstan": "^2.0",
@@ -19,7 +31,8 @@
         "phpunit/phpunit": "^11.4"
     },
     "suggest": {
-        "ext-pdo_mysql": "for the MariaDB driver"
+        "ext-pdo_mysql": "for the MariaDB driver over PDO",
+        "doctrine/dbal": "for the MariaDB driver over a Doctrine DBAL connection (DbalSql)"
     },
     "autoload": {
         "psr-4": {

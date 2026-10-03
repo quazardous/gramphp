@@ -17,7 +17,7 @@ use Quazardous\GramPHP\Time;
 
 /**
  * THE MARIADB DRIVER — node rows in InnoDB tables the application declares,
- * over a PDO connection. Also runs on MySQL 8.
+ * over PDO or Doctrine DBAL (`DbalSql`). Also runs on MySQL 8.
  *
  *     new MariadbDriver($pdo, subjectType: 'int')
  *
@@ -49,6 +49,13 @@ use Quazardous\GramPHP\Time;
  * lock until its own commit, and the forget's deletion that follows sees its
  * row.
  *
+ * DEADLOCKS ARE THE CALLER'S TO RETRY. Subjects are written in sorted order
+ * and the journal writes once per claim, so that two claiming transactions
+ * take their locks in the same order. A transaction mixing several claims and
+ * forgets on the same subjects can still meet a deadlock: InnoDB reports it
+ * (error 1213, SQLSTATE 40001), rolls the transaction back, and the caller
+ * retries it. Nothing is ever half-written.
+ *
  * SUBJECTS COME BACK AS GIVEN: `subjectType` is the type of your ids, `'int'`
  * (a BIGINT column) or `'string'` (VARCHAR), and every subject read from the
  * tables is returned in that type.
@@ -62,9 +69,14 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
 
     private bool $checked = false;
 
-    /** @param 'int'|'string' $subjectType */
+    private readonly Sql $sql;
+
+    /**
+     * @param \PDO|Sql       $connection a PDO connection, or any `Sql` (`DbalSql` for Doctrine DBAL)
+     * @param 'int'|'string' $subjectType
+     */
     public function __construct(
-        private readonly \PDO $pdo,
+        \PDO|Sql $connection,
         private readonly string $subjectType = 'string',
         private readonly string $table = 'grampy_nodes',
         private readonly string $revisions = 'grampy_revisions',
@@ -75,7 +87,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
         foreach ([$table, $revisions, $history, $limits, $subject] as $identifier) {
             self::checkIdentifier($identifier);
         }
-        $this->pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+        $this->sql = $connection instanceof Sql ? $connection : new PdoSql($connection);
     }
 
     /**
@@ -116,7 +128,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
 
     public function now(): string
     {
-        return self::text($this->run('SELECT DATE_FORMAT(UTC_TIMESTAMP(), ?)', ['%Y-%m-%dT%H:%i:%s+00:00'])->fetchColumn());
+        return self::text($this->scalar('SELECT DATE_FORMAT(UTC_TIMESTAMP(), ?)', ['%Y-%m-%dT%H:%i:%s+00:00']));
     }
 
     // -- read ------------------------------------------------------------
@@ -146,7 +158,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     {
         $out = [];
         foreach (array_chunk($subjects, self::CHUNK) as $chunk) {
-            $rows = $this->rows(
+            $rows = $this->sql->select(
                 "SELECT {$this->subject}, node, status FROM {$this->table} WHERE {$this->subject} IN (" . self::marks($chunk) . ')',
                 $chunk,
             );
@@ -161,7 +173,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     public function history(int|string $subject): array
     {
         $out = [];
-        foreach ($this->rows(
+        foreach ($this->sql->select(
             'SELECT ' . self::COLUMNS . ", archived_at, reason FROM {$this->history} "
             . "WHERE {$this->subject} = ? ORDER BY archived_at, node, id",
             [$subject],
@@ -184,7 +196,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     {
         $out = [];
         foreach (array_chunk($subjects, self::CHUNK) as $chunk) {
-            $rows = $this->rows(
+            $rows = $this->sql->select(
                 "SELECT {$this->subject}, COUNT(*) FROM {$this->history} WHERE node = ? AND reason = ? "
                 . "AND {$this->subject} IN (" . self::marks($chunk) . ") GROUP BY {$this->subject}",
                 [$name, $reason, ...$chunk],
@@ -208,7 +220,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
                 $sql .= ' AND reason = ?';
                 $params[] = $reason;
             }
-            foreach ($this->rows($sql . " GROUP BY {$this->subject}", $params) as [$subject, $at]) {
+            foreach ($this->sql->select($sql . " GROUP BY {$this->subject}", $params) as [$subject, $at]) {
                 $out[Subject::key($this->cast($subject))] = self::text($at);
             }
         }
@@ -220,7 +232,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     {
         $out = [];
         foreach (array_chunk($subjects, self::CHUNK) as $chunk) {
-            $rows = $this->rows(
+            $rows = $this->sql->select(
                 "SELECT {$this->subject}, policy FROM {$this->revisions} WHERE {$this->subject} IN ("
                 . self::marks($chunk) . ') AND policy IS NOT NULL',
                 $chunk,
@@ -236,7 +248,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     public function statusCounts(string $name): array
     {
         $out = [];
-        foreach ($this->rows("SELECT status, COUNT(*) FROM {$this->table} WHERE node = ? GROUP BY status", [$name]) as [$status, $count]) {
+        foreach ($this->sql->select("SELECT status, COUNT(*) FROM {$this->table} WHERE node = ? GROUP BY status", [$name]) as [$status, $count]) {
             $out[self::text($status)] = self::integer($count);
         }
 
@@ -246,7 +258,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     public function nodeTimes(string $name): array
     {
         $out = [];
-        $rows = $this->rows(
+        $rows = $this->sql->select(
             "SELECT status, MIN(started_at) FROM {$this->table} WHERE node = ? AND status IN (?, ?) GROUP BY status",
             [$name, Status::Running->value, Status::Scheduled->value],
         );
@@ -261,7 +273,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     {
         $lines = [];
         foreach (array_chunk($subjects, self::CHUNK) as $chunk) {
-            $rows = $this->rows(
+            $rows = $this->sql->select(
                 "SELECT COALESCE(finished_at, ?), node, {$this->subject}, started_at, status FROM {$this->table} "
                 . "WHERE status NOT IN (?, ?, ?) AND {$this->subject} IN (" . self::marks($chunk) . ')',
                 [$at, Status::Skipped->value, Status::Omitted->value, Status::Scheduled->value, ...$chunk],
@@ -285,11 +297,11 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
             return true;
         }
         $satisfying = Status::satisfying();
-        $found = $this->run(
+        $found = $this->scalar(
             "SELECT COUNT(*) FROM {$this->table} WHERE {$this->subject} = ? AND node IN (" . self::marks($parents)
             . ') AND status IN (' . self::marks($satisfying) . ')',
             [$subject, ...$parents, ...$satisfying],
-        )->fetchColumn();
+        );
 
         return self::integer($found) === \count($parents);
     }
@@ -304,29 +316,29 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
         usort($entries, static fn(array $a, array $b): int => strcmp((string) $a[0], (string) $b[0]));
         $taken = [];
         foreach ($entries as [$subject, $revision]) {
-            $this->run("INSERT IGNORE INTO {$this->revisions} ({$this->subject}, revision) VALUES (?, 0)", [$subject]);
-            $current = $this->run(
+            $this->sql->execute("INSERT IGNORE INTO {$this->revisions} ({$this->subject}, revision) VALUES (?, 0)", [$subject]);
+            $current = $this->scalar(
                 "SELECT revision FROM {$this->revisions} WHERE {$this->subject} = ? LOCK IN SHARE MODE",
                 [$subject],
-            )->fetchColumn();
+            );
             if (self::integer($current) !== $revision) {
                 continue;
             }
             // The due retry first: an UPDATE locks the row it changes and
             // re-reads it; a row that is not a due retry is left untouched.
-            $updated = $this->run(
+            $updated = $this->sql->execute(
                 "UPDATE {$this->table} SET status = ?, started_at = ?, finished_at = ?, lease = ? "
                 . "WHERE {$this->subject} = ? AND node = ? AND status = ? AND started_at <= ?",
                 [$status, $now, $finished, $lease, $subject, $name, Status::Scheduled->value, $now],
-            )->rowCount();
+            );
             if (1 === $updated) {
                 $taken[] = $subject;
                 continue;
             }
-            $inserted = $this->run(
+            $inserted = $this->sql->execute(
                 "INSERT IGNORE INTO {$this->table} ({$this->subject}, " . self::COLUMNS . ') VALUES (?, ?, ?, ?, ?, ?)',
                 [$subject, $name, $status, $now, $finished, $lease],
-            )->rowCount();
+            );
             if (1 === $inserted) {
                 $taken[] = $subject;
             }
@@ -346,12 +358,12 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
                 $sql .= ' AND lease = ?';
                 $params[] = $lease;
             }
-            if (1 !== $this->run($sql, $params)->rowCount()) {
+            if (1 !== $this->sql->execute($sql, $params)) {
                 continue;
             }
             ++$count;
             foreach ($omit as $other) {
-                $this->run(
+                $this->sql->execute(
                     "INSERT IGNORE INTO {$this->table} ({$this->subject}, node, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?)",
                     [$subject, $other, Status::Omitted->value, $now, $now],
                 );
@@ -364,7 +376,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
             }
             if (null !== $reschedule) {
                 $this->takeAway("node = ? AND {$this->subject} = ?", [$name, $subject], $now, Reason::Retry->value);
-                $this->run(
+                $this->sql->execute(
                     "INSERT INTO {$this->table} ({$this->subject}, node, status, started_at) VALUES (?, ?, ?, ?)",
                     [$subject, $name, Status::Scheduled->value, $reschedule],
                 );
@@ -379,10 +391,10 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
         $this->requireTransaction();
         $count = 0;
         foreach ($subjects as $subject) {
-            $count += $this->run(
+            $count += $this->sql->execute(
                 "INSERT IGNORE INTO {$this->table} ({$this->subject}, node, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?)",
                 [$subject, $name, Status::Done->value, $now, $now],
-            )->rowCount();
+            );
         }
 
         return $count;
@@ -430,7 +442,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     {
         $this->requireTransaction();
         foreach ($subjects as $subject) {
-            $this->run(
+            $this->sql->execute(
                 "INSERT INTO {$this->revisions} ({$this->subject}, revision, policy) VALUES (?, 0, ?) ON DUPLICATE KEY UPDATE policy = ?",
                 [$subject, $policy, $policy],
             );
@@ -443,7 +455,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     {
         $this->requireTransaction();
         foreach ($subjects as $subject) {
-            $this->run(
+            $this->sql->execute(
                 "INSERT INTO {$this->history} ({$this->subject}, " . self::COLUMNS . ', archived_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                 [$subject, $name, $status, $now, $now, $ref, $now, $reason],
             );
@@ -456,10 +468,10 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     {
         $this->requireTransaction();
 
-        return $this->run(
+        return $this->sql->execute(
             "DELETE FROM {$this->history} WHERE archived_at < ? AND reason NOT IN (" . ([] === $keep ? 'NULL' : self::marks($keep)) . ')',
             [$before, ...$keep],
-        )->rowCount();
+        );
     }
 
     /**
@@ -474,12 +486,12 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
         sort($wanted, \SORT_STRING);
         if ([] !== $wanted) {
             foreach ($wanted as $key) {
-                $this->run("INSERT IGNORE INTO {$this->limits} (`key`, value) VALUES (?, NULL)", [$key]);
+                $this->sql->execute("INSERT IGNORE INTO {$this->limits} (`key`, value) VALUES (?, NULL)", [$key]);
             }
-            $this->run(
+            $this->sql->select(
                 "SELECT `key` FROM {$this->limits} WHERE `key` IN (" . self::marks($wanted) . ') ORDER BY `key` FOR UPDATE',
                 $wanted,
-            )->fetchAll();
+            );
         }
 
         return $block();
@@ -491,17 +503,11 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     private function candidates(mixed $candidates): iterable
     {
         if ($candidates instanceof Query) {
-            $statement = $this->run($candidates->sql, $candidates->params);
-            $keyAt = null;
-            for ($i = 0; $i < $statement->columnCount(); ++$i) {
-                $meta = $statement->getColumnMeta($i);
-                if (false !== $meta && 'grampy_key' === $meta['name']) {
-                    $keyAt = $i;
-                }
-            }
-            foreach (self::listRows($statement) as $row) {
-                $key = null === $keyAt || null === $row[$keyAt] ? null : self::text($row[$keyAt]);
-                yield [$this->cast($row[0]), $key];
+            [$names, $rows] = $this->sql->selectNamed($candidates->sql, $candidates->params);
+            $keyAt = array_search('grampy_key', $names, true);
+            foreach ($rows as $row) {
+                $key = false === $keyAt || null === ($row[$keyAt] ?? null) ? null : self::text($row[$keyAt]);
+                yield [$this->cast($row[0] ?? null), $key];
             }
 
             return;
@@ -538,7 +544,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
             // reads leaves rows the claim refuses, or a revision its write does —
             // never a parent since forgotten paired with the revision raised by
             // forgetting it.
-            $read = $this->rows(
+            $read = $this->sql->select(
                 "SELECT {$this->subject}, revision, policy, version FROM {$this->revisions} WHERE {$this->subject} IN (" . self::marks($chunk) . ')',
                 $chunk,
             );
@@ -548,7 +554,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
                 $policies[$key] = self::textOrNull($policy);
                 $versions[$key] = self::textOrNull($version);
             }
-            $read = $this->rows(
+            $read = $this->sql->select(
                 "SELECT {$this->subject}, node, status, started_at, finished_at FROM {$this->table} "
                 . "WHERE {$this->subject} IN (" . self::marks($chunk) . ') AND node IN (' . self::marks($nodes) . ')',
                 [...$chunk, ...$nodes],
@@ -584,7 +590,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
 
     private function raiseRevision(int|string $subject): void
     {
-        $this->run(
+        $this->sql->execute(
             "INSERT INTO {$this->revisions} ({$this->subject}, revision) VALUES (?, 1) ON DUPLICATE KEY UPDATE revision = revision + 1",
             [$subject],
         );
@@ -598,21 +604,21 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
      */
     private function takeAway(string $where, array $params, string $now, string $reason): int
     {
-        $rows = $this->rows(
+        $rows = $this->sql->select(
             "SELECT {$this->subject}, " . self::COLUMNS . " FROM {$this->table} WHERE {$where} FOR UPDATE",
             $params,
         );
         if ([] === $rows) {
             return 0;
         }
-        $insert = $this->pdo->prepare(
-            "INSERT INTO {$this->history} ({$this->subject}, " . self::COLUMNS . ', archived_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        );
         foreach ($rows as $row) {
-            $insert->execute([...$row, $now, $reason]);
+            $this->sql->execute(
+                "INSERT INTO {$this->history} ({$this->subject}, " . self::COLUMNS . ', archived_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                [...$row, $now, $reason],
+            );
         }
 
-        return $this->run("DELETE FROM {$this->table} WHERE {$where}", $params)->rowCount();
+        return $this->sql->execute("DELETE FROM {$this->table} WHERE {$where}", $params);
     }
 
     /** Checked once per driver, before its first write. */
@@ -621,7 +627,7 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
         if ($this->checked) {
             return;
         }
-        if (!$this->pdo->inTransaction()) {
+        if (!$this->sql->inTransaction()) {
             throw new \LogicException(
                 'the journal runs outside a transaction: each statement would be its own transaction, '
                 . 'which voids every lock and every write of several statements it relies on. '
@@ -629,9 +635,9 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
             );
         }
         try {
-            $level = self::text($this->run('SELECT @@SESSION.transaction_isolation')->fetchColumn());
-        } catch (\PDOException) {
-            $level = self::text($this->run('SELECT @@SESSION.tx_isolation')->fetchColumn());
+            $level = self::text($this->scalar('SELECT @@SESSION.transaction_isolation'));
+        } catch (\Throwable) {
+            $level = self::text($this->scalar('SELECT @@SESSION.tx_isolation'));
         }
         if ('READ-COMMITTED' !== strtoupper(str_replace('_', '-', $level))) {
             throw new \LogicException(\sprintf(
@@ -645,26 +651,13 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     }
 
     /**
-     * The rows of a statement, each a list of its columns.
+     * The first column of the first row, null when there is none.
      *
      * @param list<mixed> $params
-     *
-     * @return list<list<mixed>>
      */
-    private function rows(string $sql, array $params = []): array
+    private function scalar(string $sql, array $params = []): mixed
     {
-        return self::listRows($this->run($sql, $params));
-    }
-
-    /** @return list<list<mixed>> */
-    private static function listRows(\PDOStatement $statement): array
-    {
-        $out = [];
-        foreach ($statement->fetchAll(\PDO::FETCH_NUM) as $row) {
-            $out[] = \is_array($row) ? array_values($row) : [];
-        }
-
-        return $out;
+        return $this->sql->select($sql, $params)[0][0] ?? null;
     }
 
     private static function text(mixed $value): string
@@ -680,15 +673,6 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
     private static function integer(mixed $value): int
     {
         return \is_numeric($value) ? (int) $value : throw new \UnexpectedValueException('a non-numeric value read from the database');
-    }
-
-    /** @param list<mixed> $params */
-    private function run(string $sql, array $params = []): \PDOStatement
-    {
-        $statement = $this->pdo->prepare($sql);
-        $statement->execute($params);
-
-        return $statement;
     }
 
     private function cast(mixed $subject): int|string

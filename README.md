@@ -64,7 +64,7 @@ time. What gramphp adds, each proven by the shared driver contract:
 | driver | storage | concurrency |
 |---|---|---|
 | `Driver\Memory\MemoryDriver` | arrays, one process | the reference; for tests and single-process use |
-| `Driver\Mariadb\MariadbDriver` | InnoDB tables over PDO (MariaDB, MySQL 8) | READ COMMITTED, in the caller's transaction |
+| `Driver\Mariadb\MariadbDriver` | InnoDB tables over PDO or Doctrine DBAL (MariaDB, MySQL 8) | READ COMMITTED, in the caller's transaction |
 
 ```php
 use Quazardous\GramPHP\Driver\Mariadb\MariadbDriver;
@@ -86,6 +86,19 @@ $pdo->commit();
 The journal never commits: the application opens and ends the transaction
 around each call, so a node row and the application's own writes can go in
 one transaction.
+
+With Doctrine, share the application's DBAL connection:
+
+```php
+use Quazardous\GramPHP\Driver\Mariadb\DbalSql;
+
+$journal = new NodeJournal(new MariadbDriver(new DbalSql($connection), subjectType: 'int'), $dag);
+$lease = $connection->transactional(fn() => $journal->claim('ship', 50, $candidates));
+```
+
+A transaction mixing several claims and forgets on the same subjects can
+meet a deadlock: InnoDB reports it (error 1213, SQLSTATE 40001), rolls the
+transaction back, and the caller retries it — nothing is ever half-written.
 
 ## Monitoring
 
