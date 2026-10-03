@@ -6,6 +6,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The README no longer lists the journal's internal statuses: they move to
+  `docs/concepts.md`, with the claim rule, the history, and how a node maps
+  onto the application's own states (`working`, `state`).
+
 ## [0.1.0] - 2026-10-03
 
 The first release: the whole workflow model of grampy, in PHP.

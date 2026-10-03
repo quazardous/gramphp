@@ -17,11 +17,11 @@ PHP 8.2 or later. The MariaDB driver needs `ext-pdo_mysql`, or `doctrine/dbal` 4
 to share a Doctrine connection.
 
 You declare a DAG of nodes. Each *subject* (a job, an order, a feed…) goes
-through the nodes; a **node journal** records, per subject and per node,
-whether the node is `running`, `scheduled`, `done`, `skipped`, `failed` or
-`omitted`. Workers **claim** a node for eligible subjects, **conclude** it,
-and the graph decides what becomes claimable next — forks run in parallel,
-joins wait for their parents.
+through the nodes, and a **node journal** keeps track of how far each one has
+gone. Workers **claim** a node for eligible subjects, **conclude** it, and the
+graph decides what becomes claimable next — forks run in parallel, joins wait
+for their parents. Your subjects keep their own states: the journal sits
+beside them.
 
 ```php
 use Quazardous\GramPHP\Dag;
@@ -29,7 +29,6 @@ use Quazardous\GramPHP\Driver\Memory\MemoryDriver;
 use Quazardous\GramPHP\Node;
 use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Retry;
-use Quazardous\GramPHP\Status;
 
 $journal = new NodeJournal(new MemoryDriver(), new Dag(
     new Node('pay'),
@@ -42,7 +41,6 @@ foreach ($lease as $order) {
 }
 $journal->conclude('pay', $lease, $lease->token);
 
-$journal->progress(1);                                        // ['pay' => Status::Done]
 $journal->claim('ship', 10, candidates: [1, 2, 3]);           // pay is done: ship is next
 ```
 
@@ -254,7 +252,7 @@ $items->conclude('pay', $lease);                 // the token travels with the l
 Objects handed in travel with the claim and are never loaded twice; ids —
 and a driver's `Query` — are loaded with `inflate`, once per call, and an id
 nothing loads lands in `$lease->missing`. `applies()` gives an optional node
-up (concluded `skipped`) for the items it is not for; `branch()` names the
+up for the items it is not for; `branch()` names the
 way out of a choice. The layer translates and stops there: everything it
 does is a call the id-based API could have made by hand.
 
@@ -273,7 +271,7 @@ And drawn, every mechanism with a shape of its own, counts overlaid if given:
 ```php
 use Quazardous\GramPHP\Diagram;
 
-echo Diagram::mermaid($graph, Diagram::overlay($journal));   // flowchart, ▶ running ✓ done …
+echo Diagram::mermaid($graph, Diagram::overlay($journal));   // flowchart, live counts per node
 echo Diagram::stateDiagram($graph);                          // the statechart reading
 echo Diagram::dot($graph);                                   // Graphviz
 ```
@@ -281,9 +279,14 @@ echo Diagram::dot($graph);                                   // Graphviz
 ## Monitoring
 
 `$journal->snapshot($candidates)` gives, per node, plain numbers to sample
-and alert on: the count per status, `oldest_running` (a stuck worker past
+and alert on: how many subjects stand where, `oldest_running` (a stuck worker past
 its lease), `next_due` (negative: retries overdue), `ready` (how many a claim
 could take now) and `oldest_ready` (starvation).
+
+## How it works
+
+[docs/concepts.md](docs/concepts.md): the journal's own vocabulary, the claim
+rule, the history, and how a node maps onto your subject's states.
 
 ## Status of the port
 
