@@ -1,0 +1,31 @@
+# Development and test environment. `make test` runs everything inside it.
+# The MariaDB credentials below are throwaway, for the test server only.
+services:
+  php:
+    build: docker/php
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      GRAMPHP_TEST_MARIADB_DSN: "mysql:host=mariadb;port=3306;dbname=gramphp;charset=utf8mb4"
+      GRAMPHP_TEST_MARIADB_USER: gramphp
+      GRAMPHP_TEST_MARIADB_PASSWORD: gramphp
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MARIADB_ROOT_PASSWORD: gramphp
+      MARIADB_DATABASE: gramphp
+      MARIADB_USER: gramphp
+      MARIADB_PASSWORD: gramphp
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

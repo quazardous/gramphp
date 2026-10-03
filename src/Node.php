@@ -1,0 +1,88 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Quazardous\GramPHP;
+
+/**
+ * A node of the graph: who it descends from, how it joins, what it projects.
+ *
+ * `parents` IS THE ONLY DECLARATION OF ORDER. Empty means it starts from the
+ * root — a freshly submitted subject. Parents are DIRECT, never transitive.
+ *
+ * `working` and `state` ARE PROJECTIONS, NOT COMMANDS: the label an
+ * application may mirror on its subject while the node runs, and once it
+ * concludes. Nothing in this package reads them to decide what to claim.
+ *
+ * `optional`: the node may be skipped (`$journal->skip()`, or once `grace`
+ * has passed since its parents concluded) and its children go on.
+ *
+ * `once`: a replay does not redo it.
+ *
+ * HOW A NODE JOINS ITS PARENTS — data, not code:
+ *
+ * - `on` says, per parent, which of its statuses this node accepts; a parent
+ *   not named accepts `Status::satisfying()`. A compensation that runs when a
+ *   reservation failed and the payment went through:
+ *   `new Node('refund', parents: ['pay', 'reserve'], on: ['reserve' => [Status::Failed]])`
+ * - `need` is how many parents must be accepted — all of them when null.
+ * - `choice` marks a node that concludes by NAMING one of its children: the
+ *   others, and whatever only they lead to, are `omitted` in the same write.
+ * - `loop` declares a way back (`Loop`), bounded.
+ *
+ * TIME:
+ *
+ * - `retry` declares what a failure does first (`Retry`): archived, and the
+ *   node scheduled again after a delay, a bounded number of times.
+ * - `lease`: how long a worker may hold this node (`"10m"`); past it,
+ *   `$journal->expire()` gives the row back as if the worker had died.
+ * - `wait` makes the node an ATTENDED EVENT rather than work: no worker
+ *   claims it; `$journal->settle()` concludes it `done` once a signal of that
+ *   name was received for the subject — before the wait began included — or
+ *   `failed` once `timeout` has passed since its parents concluded.
+ * - `grace` gives an optional node that long, once its parents concluded,
+ *   before `$journal->settle()` skips it.
+ */
+final readonly class Node
+{
+    /** @var list<string> */
+    public array $parents;
+
+    /** @var array<string, list<string>> parent => statuses accepted */
+    public array $on;
+
+    /**
+     * @param array<string>                      $parents
+     * @param array<string, array<Status|string>> $on
+     */
+    public function __construct(
+        public string $name,
+        array $parents = [],
+        public ?string $working = null,
+        public ?string $state = null,
+        public bool $optional = false,
+        public bool $once = false,
+        array $on = [],
+        public ?int $need = null,
+        public bool $choice = false,
+        public ?Loop $loop = null,
+        public ?Retry $retry = null,
+        public int|float|string|null $lease = null,
+        public ?string $wait = null,
+        public int|float|string|null $timeout = null,
+        public int|float|string|null $grace = null,
+    ) {
+        $this->parents = array_values($parents);
+        $edges = [];
+        foreach ($on as $parent => $statuses) {
+            $edges[(string) $parent] = array_values(array_map(Status::valueOf(...), $statuses));
+        }
+        $this->on = $edges;
+    }
+
+    /** True when the node joins otherwise than "every parent satisfying". */
+    public function customJoin(): bool
+    {
+        return [] !== $this->on || null !== $this->need;
+    }
+}
