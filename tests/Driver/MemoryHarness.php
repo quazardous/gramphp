@@ -15,9 +15,9 @@ use Quazardous\GramPHP\Tests\Contract\Store;
 
 final class MemoryHarness implements Harness
 {
-    public function journal(Dag $dag, callable $clock, string $subjectType = 'string'): NodeJournal
+    public function journal(Dag $dag, callable $clock, string $subjectType = 'string', array $mergers = []): NodeJournal
     {
-        return new NodeJournal(new MemoryDriver(), $dag, $clock);
+        return new NodeJournal(new MemoryDriver(), $dag, $clock, mergers: $mergers);
     }
 
     public function candidates(array $subjects): mixed

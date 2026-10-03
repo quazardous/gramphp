@@ -71,6 +71,15 @@ abstract class Adapter
         return null;
     }
 
+    /**
+     * What version of the item arrives in a lane — opaque to gramphp,
+     * compared to nothing, handed back as it was given.
+     */
+    public function refOf(mixed $item): ?string
+    {
+        return null;
+    }
+
     /** Which branch this item takes out of a `choice` node. */
     public function branch(mixed $item, string $node): ?string
     {

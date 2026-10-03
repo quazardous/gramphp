@@ -444,6 +444,57 @@ final class Dag implements \IteratorAggregate, \Countable
         if (null !== $node->grace && !$node->optional) {
             throw new DagError(\sprintf("node '%s': grace skips an optional node — this one is not", $node->name));
         }
+        if (null !== $node->lane) {
+            $this->checkLane($node, $node->lane);
+        }
+    }
+
+    private function checkLane(Node $node, Lane $lane): void
+    {
+        $modes = [Merge::First->value, Merge::Last->value, Merge::All->value];
+        if (!\in_array($lane->merge, $modes, true) && null === $lane->merger()) {
+            throw new DagError(\sprintf(
+                "node '%s': lane merge=%s — expected one of [%s], or Merge::fn('<name>') and a function the journal is given",
+                $node->name,
+                var_export($lane->merge, true),
+                implode(', ', $modes),
+            ));
+        }
+        if ('' === $lane->merger()) {
+            throw new DagError(\sprintf("node '%s': lane merge=%s names no function", $node->name, var_export($lane->merge, true)));
+        }
+        if ($lane->maxSize < 1) {
+            throw new DagError(\sprintf("node '%s': lane maxSize=%d — keeping fewer than one ref keeps nothing", $node->name, $lane->maxSize));
+        }
+        foreach (['cooldown' => $lane->cooldown, 'delay' => $lane->delay, 'maxWait' => $lane->maxWait] as $label => $value) {
+            if (null === $value) {
+                continue;
+            }
+            try {
+                $seconds = Time::seconds($value);
+            } catch (\InvalidArgumentException $e) {
+                throw new DagError(\sprintf("node '%s': lane %s %s — %s", $node->name, $label, var_export($value, true), $e->getMessage()), 0, $e);
+            }
+            if ($seconds <= 0) {
+                throw new DagError(\sprintf("node '%s': lane %s %s — a duration must last", $node->name, $label, var_export($value, true)));
+            }
+        }
+        $unfit = array_keys(array_filter([
+            'wait' => null !== $node->wait,
+            'choice' => $node->choice,
+            'loop' => null !== $node->loop,
+            'retry' => null !== $node->retry,
+            'lease' => null !== $node->lease,
+            'grace' => null !== $node->grace,
+            'optional' => $node->optional,
+        ]));
+        if ([] !== $unfit) {
+            throw new DagError(\sprintf(
+                "node '%s' is a lane: it is entered, never worked, so it cannot take [%s]",
+                $node->name,
+                implode(', ', $unfit),
+            ));
+        }
     }
 
     /**

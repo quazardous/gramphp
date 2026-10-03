@@ -55,7 +55,7 @@ final class MariadbHarness implements Harness
     public function createTables(string $subjectType): array
     {
         $prefix = \sprintf('g%d_%d', getmypid(), ++self::$counter);
-        $tables = ['table' => "{$prefix}_nodes", 'revisions' => "{$prefix}_rev", 'history' => "{$prefix}_hist", 'limits' => "{$prefix}_lim"];
+        $tables = ['table' => "{$prefix}_nodes", 'revisions' => "{$prefix}_rev", 'history' => "{$prefix}_hist", 'limits' => "{$prefix}_lim", 'arrivals' => "{$prefix}_arr"];
         $db = $this->connect();
         foreach (MariadbDriver::schema($subjectType, ...$tables) as $statement) {
             $db->exec($statement);
@@ -71,16 +71,16 @@ final class MariadbHarness implements Harness
      */
     public static function driver(TestDb $db, array $tables, string $subjectType): MariadbDriver
     {
-        return new MariadbDriver($db->sql(), $subjectType, $tables['table'], $tables['revisions'], $tables['history'], $tables['limits']);
+        return new MariadbDriver($db->sql(), $subjectType, $tables['table'], $tables['revisions'], $tables['history'], $tables['limits'], arrivals: $tables['arrivals']);
     }
 
-    public function journal(Dag $dag, callable $clock, string $subjectType = 'string'): NodeJournal
+    public function journal(Dag $dag, callable $clock, string $subjectType = 'string', array $mergers = []): NodeJournal
     {
         $tables = $this->createTables($subjectType);
         $db = $this->connect();
         $db->begin();
         $this->open[] = $db;
-        $journal = new NodeJournal(self::driver($db, $tables, $subjectType), $dag, $clock);
+        $journal = new NodeJournal(self::driver($db, $tables, $subjectType), $dag, $clock, mergers: $mergers);
         $this->of[$journal] = ['db' => $db, 'tables' => $tables];
 
         return $journal;

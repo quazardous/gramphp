@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Quazardous\GramPHP;
 
 use Quazardous\GramPHP\Driver\CoreDriver;
+use Quazardous\GramPHP\Driver\LaneDriver;
 use Quazardous\GramPHP\Driver\MissingCapability;
 use Quazardous\GramPHP\Driver\NodeTimes;
 use Quazardous\GramPHP\Driver\ProgressMany;
@@ -21,7 +22,9 @@ use Quazardous\GramPHP\Driver\ReadingDriver;
  *     release   give back the leases of a dead worker
  *     expire    give back every lease held longer than its node allows
  *     signal    record that an awaited event happened, for subjects
- *     settle    conclude waits, and skip optional nodes past their grace
+ *     arrive    a subject comes back: it waits in a lane before running again
+ *     settle    conclude waits, let due arrivals through their lane, and skip
+ *               optional nodes past their grace
  *     history   every row forget, release, a retry or a loop took away
  *     progress  what is recorded for ONE subject
  *     snapshot  where each node stands, for monitoring
@@ -69,20 +72,32 @@ final class NodeJournal
 
     private readonly \Random\Randomizer $rng;
 
+    /** @var array<string, \Closure(list<string>, ?string): iterable<string>> */
+    private readonly array $mergers;
+
     /**
-     * @param Dag|list<Node>                          $dag   checked when the journal is built
-     * @param (callable(): (string|\DateTimeInterface))|null $clock defaults to the driver's: one time for every process
+     * @param Dag|list<Node>                                              $dag     checked when the journal is built
+     * @param (callable(): (string|\DateTimeInterface))|null              $clock   defaults to the driver's: one time for every process
+     * @param array<string, callable(list<string>, ?string): iterable<string>> $mergers the functions a lane names (`Merge::fn('<name>')`):
+     *                                                                             given the refs waiting and the one arriving, the refs to keep
      */
     public function __construct(
         public readonly CoreDriver $driver,
         Dag|array $dag,
         ?callable $clock = null,
         ?\Random\Randomizer $rng = null,
+        array $mergers = [],
     ) {
         $this->dag = $dag instanceof Dag ? $dag : new Dag(...$dag);
         $this->dag->check();
         $this->clock = null === $clock ? null : \Closure::fromCallable($clock);
         $this->rng = $rng ?? new \Random\Randomizer();
+        $this->mergers = array_map(\Closure::fromCallable(...), $mergers);
+        foreach ($this->dag as $node) {
+            if (null !== $node->lane && !$driver instanceof LaneDriver) {
+                throw new MissingCapability('lane', \sprintf("node '%s', a lane", $node->name), LaneDriver::class);
+            }
+        }
     }
 
     /** The journal's time: the injected clock read into the one format, or the driver's. */
@@ -116,6 +131,12 @@ final class NodeJournal
                 "node '%s' waits for '%s': it is settled (`settle`), never claimed",
                 $name,
                 $node->wait,
+            ));
+        }
+        if (null !== $node->lane) {
+            throw new \InvalidArgumentException(\sprintf(
+                "node '%s' is a lane: subjects `arrive` in it and `settle` lets them through, it is never claimed",
+                $name,
             ));
         }
         $token = bin2hex(random_bytes(16));
@@ -414,12 +435,114 @@ final class NodeJournal
         return [] === $subjects ? 0 : $this->driver->note($subjects, $event, Outcome::Received->value, Reason::Signal->value, $this->now(), $ref);
     }
 
+    // -- lanes -----------------------------------------------------------
+
+    /**
+     * THESE SUBJECTS CAME BACK — a new version of each, `ref` naming it
+     * (opaque, optional) — and wait in the lane `name` to run again.
+     *
+     * An arrival for a subject already waiting is merged, as the lane says
+     * (`Lane::$merge`, `Lane::$position`); the merge is noted in the history.
+     * With `WhileRunning::Skip`, an arrival for a subject whose pass is still
+     * running is dropped, and noted. `urgent` lets the arrival through at the
+     * next `settle` whatever its cooldown or delay — never over a running pass.
+     *
+     * Nothing runs here: `settle` lets due arrivals in. Return `['queued' => n,
+     * 'merged' => n, 'skipped' => n]`.
+     *
+     * @param iterable<int|string> $subjects
+     *
+     * @return array{queued: int, merged: int, skipped: int}
+     */
+    public function arrive(string $name, iterable $subjects, ?string $ref = null, bool $urgent = false): array
+    {
+        $node = $this->dag->node($name);
+        if (null === $node->lane) {
+            throw new \InvalidArgumentException(\sprintf("node '%s' is not a lane: nothing arrives in it", $name));
+        }
+        $lane = $node->lane;
+        $out = ['queued' => 0, 'merged' => 0, 'skipped' => 0];
+        $subjects = Subject::unique($subjects);
+        if ([] === $subjects) {
+            return $out;
+        }
+        $driver = $this->lanes();
+        $now = $this->now();
+        $group = $subjects;
+        if (WhileRunning::Skip === $lane->whileRunning) {
+            $pass = [$name, ...$this->dag->descendants($name)];
+            $progresses = $this->progressMany($subjects);
+            $group = $skipped = [];
+            foreach ($subjects as $subject) {
+                $busy = false;
+                foreach ($pass as $x) {
+                    $status = $progresses[Subject::key($subject)][$x] ?? null;
+                    $busy = $busy || Status::Running === $status || Status::Scheduled === $status;
+                }
+                if ($busy) {
+                    $skipped[] = $subject;
+                } else {
+                    $group[] = $subject;
+                }
+            }
+            if ([] !== $skipped) {
+                $this->driver->note($skipped, $name, Outcome::Skipped->value, Reason::Lane->value, $now, $ref);
+                $out['skipped'] = \count($skipped);
+            }
+        }
+        if ([] === $group) {
+            return $out;
+        }
+        if ($lane->keepsEveryRef()) {
+            $this->keepEveryRef($driver, $name, $group, $lane, $ref, $now, $urgent, $out);
+
+            return $out;
+        }
+        $outcome = $driver->arrive($name, $group, $ref, $now, $lane->merge, $lane->position->value, $urgent);
+        $merged = array_values(array_filter($group, static fn(int|string $s): bool => Outcome::Merged->value === ($outcome[Subject::key($s)] ?? null)));
+        if ([] !== $merged) {
+            $this->driver->note($merged, $name, Outcome::Merged->value, Reason::Lane->value, $now, $ref);
+        }
+        $out['merged'] += \count($merged);
+        $out['queued'] += \count(array_filter($group, static fn(int|string $s): bool => Outcome::Queued->value === ($outcome[Subject::key($s)] ?? null)));
+
+        return $out;
+    }
+
+    /** What waits for this subject in the lane `name`, if anything. */
+    public function arrival(int|string $subject, string $name): ?Arrival
+    {
+        $this->dag->node($name);
+
+        return $this->lanes()->arrivals([$subject], $name)[Subject::key($subject)] ?? null;
+    }
+
+    /**
+     * EVERY VERSION WAITING for this subject in the lane `name`, oldest first —
+     * what a lane keeping them all has gathered. A lane keeping one version
+     * gives that one; a subject with nothing waiting gives nothing.
+     *
+     * @return list<string>
+     */
+    public function refs(int|string $subject, string $name): array
+    {
+        $arrival = $this->arrival($subject, $name);
+        if (null === $arrival) {
+            return [];
+        }
+        $kept = self::decodeRefs($arrival->refs);
+
+        return [] !== $kept ? $kept : (null !== $arrival->ref ? [$arrival->ref] : []);
+    }
+
     /**
      * CONCLUDE WHAT NO WORKER DOES, on the candidates, for every node:
      *
      *     wait   `done` when a signal was received since the node last went
      *            back; `failed` once `timeout` has passed since its parents
      *            concluded
+     *     lane   a due arrival enters: the previous pass is archived and the
+     *            lane is `done` (`Lane`); reported as `entered`
      *     grace  an optional node still untaken `grace` after its parents
      *            concluded is `skipped`
      *
@@ -438,6 +561,14 @@ final class NodeJournal
         $now = $this->now();
         $out = [];
         foreach ($this->dag as $node) {
+            if (null !== $node->lane) {
+                $entered = $this->letIn($node, $node->lane, $candidates, $now, $limit);
+                if ($entered > 0) {
+                    $out[$node->name][Outcome::Entered->value] = $entered;
+                }
+
+                continue;
+            }
             if (null === $node->wait && null === $node->grace) {
                 continue;
             }
@@ -591,7 +722,8 @@ final class NodeJournal
     }
 
     /**
-     * How many subjects stand where, for this node — every status present.
+     * How many subjects stand where, for this node — every status present,
+     * and for a lane, `waiting`: the arrivals waiting.
      *
      * @return array<string, int>
      */
@@ -602,6 +734,9 @@ final class NodeJournal
         $out = [];
         foreach ([Status::Running->value, Status::Scheduled->value, ...Status::concluded()] as $status) {
             $out[$status] = (int) ($byStatus[$status] ?? 0);
+        }
+        if (null !== $this->dag->node($name)->lane) {
+            $out[Outcome::Waiting->value] = $this->lanes()->queued($name);
         }
 
         return $out;
@@ -623,7 +758,9 @@ final class NodeJournal
      *     <status>        how many rows, as `counts()` gives them
      *     oldest_running  seconds the longest-running row has run
      *     next_due        seconds until the earliest retry is due (negative: overdue)
-     *     ready           with `candidates`: how many a claim could take now
+     *     oldest_waiting  seconds the oldest arrival has waited (lanes)
+     *     ready           with `candidates`, for a node a claim takes: how many
+     *                     a claim could take now
      *     oldest_ready    seconds since the oldest of those became ready
      *
      * A time is null when nothing stands there, or when the driver keeps no
@@ -652,7 +789,10 @@ final class NodeJournal
             $entry['oldest_running'] = Time::age($now, $times[Status::Running->value] ?? null);
             $sinceDue = Time::age($now, $times[Status::Scheduled->value] ?? null);
             $entry['next_due'] = null === $sinceDue ? null : -$sinceDue;
-            if (null !== $candidates && null === $node->wait) {
+            if (null !== $node->lane) {
+                $entry['oldest_waiting'] = Time::age($now, $this->lanes()->waitingSince($node->name));
+            }
+            if (null !== $candidates && null === $node->wait && null === $node->lane) {
                 [$entry['ready'], $entry['oldest_ready']] = $this->ready($node, $candidates, $now);
             }
             $out[$node->name] = $entry;
@@ -728,6 +868,185 @@ final class NodeJournal
         }
 
         return true;
+    }
+
+    /**
+     * MERGE BY READING WHAT WAITS, THEN WRITING — under the driver's guard, on
+     * each subject's place in this lane.
+     *
+     * `first` and `last` decide without looking, so one atomic write does
+     * them. Keeping every ref, or asking a function, cannot: two workers
+     * arriving at once would each start from the state before the other, and
+     * one would overwrite the other's version. Subjects ending up with the
+     * same refs are written together.
+     *
+     * @param list<int|string>                               $subjects
+     * @param array{queued: int, merged: int, skipped: int} $out
+     */
+    private function keepEveryRef(LaneDriver $driver, string $name, array $subjects, Lane $lane, ?string $ref, string $now, bool $urgent, array &$out): void
+    {
+        $merger = $this->merger($lane);
+        $dropped = [];
+        $merged = [];
+        $keys = array_map(static fn(int|string $s): string => "arrival|{$name}|" . Subject::key($s), $subjects);
+        $this->driver->guard($keys, function () use ($driver, $name, $subjects, $lane, $ref, $now, $urgent, $merger, &$dropped, &$merged): void {
+            $current = $driver->arrivals($subjects, $name);
+            /** @var array<string, array{0: list<string>, 1: list<int|string>}> $same */
+            $same = [];
+            foreach ($subjects as $subject) {
+                $waiting = $current[Subject::key($subject)] ?? null;
+                $kept = null === $waiting ? [] : self::decodeRefs($waiting->refs);
+                $wanted = array_values(array_map(strval(...), [...$merger($kept, $ref)]));
+                $id = (string) json_encode($wanted);
+                $same[$id] ??= [$wanted, []];
+                $same[$id][1][] = $subject;
+                foreach ($kept as $gone) {
+                    if (!\in_array($gone, $wanted, true)) {
+                        $dropped[$gone][] = $subject;
+                    }
+                }
+            }
+            foreach ($same as [$wanted, $group]) {
+                $last = [] === $wanted ? null : $wanted[\count($wanted) - 1];
+                $outcome = $driver->arrive($name, $group, $last, $now, Merge::Set->value, $lane->position->value, $urgent, self::encodeRefs($wanted));
+                foreach ($group as $subject) {
+                    if (Outcome::Merged->value === ($outcome[Subject::key($subject)] ?? null)) {
+                        $merged[] = $subject;
+                    }
+                }
+            }
+        });
+        // A REF LET GO IS STILL SAID: past `maxSize`, or refused by the
+        // function, it leaves a trace rather than vanishing.
+        foreach ($dropped as $gone => $group) {
+            $this->driver->note($group, $name, Outcome::Dropped->value, Reason::Lane->value, $now, (string) $gone);
+        }
+        if ([] !== $merged) {
+            $this->driver->note($merged, $name, Outcome::Merged->value, Reason::Lane->value, $now, $ref);
+        }
+        $out['merged'] += \count($merged);
+        $out['queued'] += \count($subjects) - \count($merged);
+    }
+
+    /**
+     * The function this lane merges with: `all`'s, or the application's under
+     * the name the lane gives.
+     *
+     * @return \Closure(list<string>, ?string): iterable<string>
+     */
+    private function merger(Lane $lane): \Closure
+    {
+        $named = $lane->merger();
+        if (null === $named) {
+            $size = $lane->maxSize;
+
+            return static function (array $kept, ?string $arriving) use ($size): array {
+                /** @var list<string> $kept */
+                return \array_slice(null === $arriving ? $kept : [...$kept, $arriving], -$size);
+            };
+        }
+        if (!isset($this->mergers[$named])) {
+            $known = array_keys($this->mergers);
+            sort($known);
+            throw new \InvalidArgumentException(\sprintf(
+                "lane merge '%s' names a function the journal was not given — pass it as new NodeJournal(..., mergers: ['%s' => \$fn]); it has [%s]",
+                $lane->merge,
+                $named,
+                implode(', ', $known),
+            ));
+        }
+
+        return $this->mergers[$named];
+    }
+
+    /**
+     * THE LANE'S DOOR. An arrival enters when the subject's parents are
+     * joined, nothing of its previous pass runs, and it is due: urgent, or
+     * past both its `delay` (from its place) and its `cooldown` (from the end
+     * of the previous pass) — or past `maxWait` from its first arrival
+     * whatever the rest. Due arrivals enter in the order of their places.
+     */
+    private function letIn(Node $node, Lane $lane, mixed $candidates, string $now, ?int $limit): int
+    {
+        $driver = $this->lanes();
+        $pass = [$node->name, ...$this->dag->descendants($node->name)];
+        $entries = [];
+        $order = [];
+        // No pre-filter on the lane's own row: the previous pass holds one.
+        foreach ($this->driver->scan($candidates, null, [...$pass, ...$node->parents], [], self::PAGE, $now) as $page) {
+            foreach ($page as $entry) {
+                $key = Subject::key($entry->subject);
+                if (!isset($entries[$key])) {
+                    $order[$key] = \count($order);
+                    $entries[$key] = $entry;
+                }
+            }
+        }
+        if ([] === $entries) {
+            return 0;
+        }
+        $waiting = $driver->arrivals(array_values(array_map(static fn(Entry $e): int|string => $e->subject, $entries)), $node->name);
+        $due = [];
+        foreach ($waiting as $key => $arrival) {
+            $entry = $entries[$key] ?? null;
+            if (null === $entry || !$this->dag->joined($node->name, $entry->rows)) {
+                continue;
+            }
+            foreach ($pass as $x) {
+                $status = $entry->rows[$x] ?? null;
+                if (Status::Running->value === $status || Status::Scheduled->value === $status) {
+                    continue 2;
+                }
+            }
+            if (!$arrival->urgent) {
+                $ready = [$arrival->place];
+                if (null !== $lane->delay) {
+                    $ready[] = Time::shift($arrival->place, Time::seconds($lane->delay));
+                }
+                $ended = array_values(array_intersect_key($entry->finished, array_flip($pass)));
+                if (null !== $lane->cooldown && [] !== $ended) {
+                    $ready[] = Time::shift(max($ended), Time::seconds($lane->cooldown));
+                }
+                $late = null !== $lane->maxWait && strcmp(Time::shift($arrival->arrivedAt, Time::seconds($lane->maxWait)), $now) <= 0;
+                if (strcmp(max($ready), $now) > 0 && !$late) {
+                    continue;
+                }
+            }
+            $due[] = [$arrival->place, $order[$key], $entry];
+        }
+        usort($due, static fn(array $a, array $b): int => [$a[0], $a[1]] <=> [$b[0], $b[1]]);
+        $chosen = array_map(static fn(array $d): array => [$d[2]->subject, $d[2]->revision], $due);
+        if (null !== $limit) {
+            $chosen = \array_slice($chosen, 0, $limit);
+        }
+
+        return [] === $chosen ? 0 : \count($driver->enter($node->name, $chosen, $pass, $now));
+    }
+
+    /** @param list<string> $refs */
+    private static function encodeRefs(array $refs): ?string
+    {
+        return [] === $refs ? null : json_encode($refs, \JSON_THROW_ON_ERROR | \JSON_UNESCAPED_UNICODE | \JSON_UNESCAPED_SLASHES);
+    }
+
+    /** @return list<string> */
+    private static function decodeRefs(?string $stored): array
+    {
+        if (null === $stored || '' === $stored) {
+            return [];
+        }
+        $refs = json_decode($stored, true, 512, \JSON_THROW_ON_ERROR);
+
+        return \is_array($refs) ? array_values(array_map(static fn(mixed $r): string => \is_scalar($r) ? (string) $r : '', $refs)) : [];
+    }
+
+    private function lanes(): LaneDriver
+    {
+        if (!$this->driver instanceof LaneDriver) {
+            throw new MissingCapability('lane', 'a lane', LaneDriver::class);
+        }
+
+        return $this->driver;
     }
 
     /** @param string $why what needs the reading capability */

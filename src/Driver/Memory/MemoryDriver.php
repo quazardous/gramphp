@@ -4,11 +4,16 @@ declare(strict_types=1);
 
 namespace Quazardous\GramPHP\Driver\Memory;
 
+use Quazardous\GramPHP\Arrival;
 use Quazardous\GramPHP\Driver\CoreDriver;
+use Quazardous\GramPHP\Driver\LaneDriver;
 use Quazardous\GramPHP\Driver\NodeTimes;
 use Quazardous\GramPHP\Driver\ReadingDriver;
 use Quazardous\GramPHP\Entry;
 use Quazardous\GramPHP\Keyed;
+use Quazardous\GramPHP\Merge;
+use Quazardous\GramPHP\Outcome;
+use Quazardous\GramPHP\Position;
 use Quazardous\GramPHP\Reason;
 use Quazardous\GramPHP\Status;
 use Quazardous\GramPHP\Subject;
@@ -25,7 +30,7 @@ use Quazardous\GramPHP\Time;
  * `candidates` is an ordered iterable of subjects (or `Keyed`): the order is
  * the priority, the first ones are taken first.
  */
-final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes
+final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDriver
 {
     /** @var array<string, array<string, Row>> Subject::key() => node => row, in the order written */
     private array $rows = [];
@@ -38,6 +43,9 @@ final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes
 
     /** @var list<array{0: string, 1: array{node: string, status: string, started_at: string, finished_at: ?string, lease: ?string, archived_at: string, reason: string}}> */
     private array $archive = [];
+
+    /** @var array<string, array<string, Arrival>> Subject::key() => lane => arrival waiting */
+    private array $waiting = [];
 
     public function now(): string
     {
@@ -268,6 +276,96 @@ final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes
     public function progress(int|string $subject): array
     {
         return array_map(static fn(Row $row): string => $row->status, $this->rows[Subject::key($subject)] ?? []);
+    }
+
+    // -- lanes -----------------------------------------------------------
+
+    public function arrive(string $name, array $subjects, ?string $ref, string $now, string $merge, string $position, bool $urgent, ?string $refs = null): array
+    {
+        $out = [];
+        foreach ($subjects as $subject) {
+            $key = Subject::key($subject);
+            $current = $this->waiting[$key][$name] ?? null;
+            if (null === $current) {
+                $this->waiting[$key][$name] = new Arrival($ref, $now, $now, $urgent, $refs);
+                $out[$key] = Outcome::Queued->value;
+
+                continue;
+            }
+            // `set`: the journal worked out ref and refs under the guard.
+            $this->waiting[$key][$name] = new Arrival(
+                \in_array($merge, [Merge::Last->value, Merge::Set->value], true) ? $ref : $current->ref,
+                Position::Last->value === $position ? $now : $current->place,
+                $current->arrivedAt,
+                $current->urgent || $urgent,
+                Merge::Set->value === $merge ? $refs : $current->refs,
+            );
+            $out[$key] = Outcome::Merged->value;
+        }
+
+        return $out;
+    }
+
+    public function arrivals(array $subjects, string $name): array
+    {
+        $out = [];
+        foreach ($subjects as $subject) {
+            $key = Subject::key($subject);
+            if (isset($this->waiting[$key][$name])) {
+                $out[$key] = $this->waiting[$key][$name];
+            }
+        }
+
+        return $out;
+    }
+
+    public function enter(string $name, array $entries, array $archive, string $now): array
+    {
+        $entered = [];
+        foreach ($entries as [$subject, $revision]) {
+            $key = Subject::key($subject);
+            $arrival = $this->waiting[$key][$name] ?? null;
+            if (null === $arrival || ($this->revisions[$key] ?? 0) !== $revision) {
+                continue;
+            }
+            foreach ($archive as $x) {
+                $status = ($this->rows[$key][$x] ?? null)?->status;
+                if (Status::Running->value === $status || Status::Scheduled->value === $status) {
+                    continue 2;
+                }
+            }
+            $this->revisions[$key] = $revision + 1;
+            foreach ($archive as $x) {
+                $this->takeAway($key, $x, $now, Reason::Arrival->value);
+            }
+            unset($this->waiting[$key][$name]);
+            $this->archive[] = [$key, [
+                'node' => $name, 'status' => Outcome::Entered->value, 'started_at' => $arrival->arrivedAt,
+                'finished_at' => $now, 'lease' => $arrival->ref, 'archived_at' => $now, 'reason' => Reason::Lane->value,
+            ]];
+            $this->rows[$key][$name] = new Row(Status::Done->value, $arrival->arrivedAt, $now);
+            $entered[] = $subject;
+        }
+
+        return $entered;
+    }
+
+    public function queued(string $name): int
+    {
+        return \count(array_filter($this->waiting, static fn(array $lanes): bool => isset($lanes[$name])));
+    }
+
+    public function waitingSince(string $name): ?string
+    {
+        $first = null;
+        foreach ($this->waiting as $lanes) {
+            $at = isset($lanes[$name]) ? $lanes[$name]->arrivedAt : null;
+            if (null !== $at && (null === $first || strcmp($at, $first) < 0)) {
+                $first = $at;
+            }
+        }
+
+        return $first;
     }
 
     // -- reading ---------------------------------------------------------

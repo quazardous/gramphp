@@ -17,10 +17,11 @@ interface Harness
      * A journal on EMPTY storage, whose subjects are `'string'` or `'int'`
      * (the storage's subject column typed accordingly).
      *
-     * @param callable(): (string|\DateTimeInterface) $clock
-     * @param 'int'|'string'                          $subjectType
+     * @param callable(): (string|\DateTimeInterface)                    $clock
+     * @param 'int'|'string'                                             $subjectType
+     * @param array<string, callable(list<string>, ?string): iterable<string>> $mergers
      */
-    public function journal(Dag $dag, callable $clock, string $subjectType = 'string'): NodeJournal;
+    public function journal(Dag $dag, callable $clock, string $subjectType = 'string', array $mergers = []): NodeJournal;
 
     /**
      * The driver's candidates, in this order.

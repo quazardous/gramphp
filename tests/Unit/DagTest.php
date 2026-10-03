@@ -8,7 +8,9 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Quazardous\GramPHP\Dag;
 use Quazardous\GramPHP\DagError;
+use Quazardous\GramPHP\Lane;
 use Quazardous\GramPHP\Loop;
+use Quazardous\GramPHP\Merge;
 use Quazardous\GramPHP\Node;
 use Quazardous\GramPHP\Retry;
 use Quazardous\GramPHP\Status;
@@ -67,6 +69,13 @@ final class DagTest extends TestCase
         yield 'grace not optional' => [[new Node('a', grace: '1d')], 'not'];
         yield 'shared state' => [[new Node('a', state: 'x'), new Node('b', parents: ['a'], state: 'x')], 'ambiguous'];
         yield 'zero lease' => [[new Node('a', lease: 0)], 'must last'];
+        yield 'lane with a retry' => [[new Node('a', lane: new Lane(), retry: new Retry(1))], 'is a lane'];
+        yield 'optional lane' => [[new Node('a', lane: new Lane(), optional: true)], 'is a lane'];
+        yield 'lane merge unknown' => [[new Node('a', lane: new Lane('sometimes'))], 'expected one of'];
+        yield 'lane merge naming nothing' => [[new Node('a', lane: new Lane(Merge::fn('')))], 'names no function'];
+        yield 'lane keeping nothing' => [[new Node('a', lane: Lane::batch(maxSize: 0))], 'keeps nothing'];
+        yield 'lane zero cooldown' => [[new Node('a', lane: Lane::throttle(0))], 'must last'];
+        yield 'lane bad delay' => [[new Node('a', lane: Lane::debounce('soon'))], 'not a duration'];
     }
 
     /** @param list<Node> $nodes */
@@ -80,9 +89,9 @@ final class DagTest extends TestCase
 
     public function testTheContractGraphsHoldTogether(): void
     {
-        foreach ([Graphs::diamond(), Graphs::saga(), Graphs::quorum(), Graphs::route(), Graphs::review(), Graphs::flaky(), Graphs::onboarding()] as $dag) {
+        foreach ([Graphs::diamond(), Graphs::saga(), Graphs::quorum(), Graphs::route(), Graphs::review(), Graphs::flaky(), Graphs::onboarding(), Graphs::listing()] as $dag) {
             $dag->check();
         }
-        $this->addToAssertionCount(7);
+        $this->addToAssertionCount(8);
     }
 }

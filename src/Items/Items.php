@@ -70,6 +70,34 @@ final class Items
         return $written;
     }
 
+    /**
+     * These items arrive in a lane, each bringing its own `refOf`. One call
+     * per distinct ref, and the counts are ADDED — what comes back is the
+     * whole batch.
+     *
+     * @param iterable<mixed> $items
+     *
+     * @return array{queued: int, merged: int, skipped: int}
+     */
+    public function arrive(string $name, iterable $items, bool $urgent = false): array
+    {
+        /** @var array<string, array{?string, list<int|string>}> $byRef */
+        $byRef = [];
+        foreach ($items as $item) {
+            $ref = $this->adapter->refOf($item);
+            $byRef["\0" . $ref] ??= [$ref, []];
+            $byRef["\0" . $ref][1][] = $this->adapter->idOf($item);
+        }
+        $out = ['queued' => 0, 'merged' => 0, 'skipped' => 0];
+        foreach ($byRef as [$ref, $ids]) {
+            foreach ($this->journal->arrive($name, $ids, $ref, $urgent) as $kind => $count) {
+                $out[$kind] += $count;
+            }
+        }
+
+        return $out;
+    }
+
     // -- take and finish ---------------------------------------------------
 
     /**

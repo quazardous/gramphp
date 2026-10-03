@@ -14,6 +14,7 @@ use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Status;
 use Quazardous\GramPHP\Tests\Contract\Brick;
 use Quazardous\GramPHP\Tests\Contract\Bricks;
+use Quazardous\GramPHP\Tests\Contract\Graphs;
 
 /** The items layer: objects in, objects out, handlers where data is needed. */
 final class ItemsTest extends TestCase
@@ -190,6 +191,36 @@ final class ItemsTest extends TestCase
         $this->items->journal->forget('scan', [1]);
         self::assertContains(['scan', 'forget'], array_map(static fn(array $row): array => [$row['node'], $row['reason']], $this->items->history($this->bricks[0])));
         self::assertSame(1, $this->items->snapshot($this->bricks, ['scan'])['scan']['ready'], 'brick 3 is still to scan');
+    }
+
+    public function testArrivalsOfDifferentVersionsAreCountedTogether(): void
+    {
+        // One call per distinct ref, but ONE set of counts: added, not the
+        // last ref's counts replacing the others'.
+        $stamps = new class ([new Brick(1), new Brick(2), new Brick(3)]) extends Adapter {
+            /** @param list<Brick> $bricks */
+            public function __construct(private readonly array $bricks) {}
+
+            public function idOf(mixed $candidate): int
+            {
+                return Bricks::brick($candidate)->id;
+            }
+
+            public function refOf(mixed $item): string
+            {
+                return 'v' . Bricks::brick($item)->id;
+            }
+
+            /** @return list<Brick> */
+            public function all(): array
+            {
+                return $this->bricks;
+            }
+        };
+        $items = new Items(new NodeJournal(new MemoryDriver(), Graphs::listing()), $stamps);
+        self::assertSame(['queued' => 3, 'merged' => 0, 'skipped' => 0], $items->arrive('arrive', $stamps->all()), 'three refs, three groups, three arrivals');
+        self::assertSame('v2', $items->journal->arrival(2, 'arrive')?->ref);
+        self::assertSame(['queued' => 0, 'merged' => 1, 'skipped' => 0], $items->arrive('arrive', [new Brick(2)]));
     }
 
     public function testATokenMayComeWithoutTheLease(): void

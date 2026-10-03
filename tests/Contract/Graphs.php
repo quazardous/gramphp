@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Quazardous\GramPHP\Tests\Contract;
 
 use Quazardous\GramPHP\Dag;
+use Quazardous\GramPHP\Lane;
 use Quazardous\GramPHP\Loop;
 use Quazardous\GramPHP\Node;
 use Quazardous\GramPHP\Retry;
@@ -90,6 +91,16 @@ final class Graphs
             new Node('activate', parents: ['clicked']),
             new Node('remind', parents: ['clicked'], on: ['clicked' => [Status::Failed]]),
             new Node('survey', parents: ['send'], optional: true, grace: '1d'),
+        );
+    }
+
+    /** A listing comes back: it waits in a lane, then is scraped and published again. */
+    public static function listing(?Lane $lane = null): Dag
+    {
+        return new Dag(
+            new Node('arrive', lane: $lane ?? Lane::throttle(cooldown: '1h')),
+            new Node('scrape', parents: ['arrive']),
+            new Node('publish', parents: ['scrape']),
         );
     }
 }

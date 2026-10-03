@@ -42,6 +42,11 @@ namespace Quazardous\GramPHP;
  *   `failed` once `timeout` has passed since its parents concluded.
  * - `grace` gives an optional node that long, once its parents concluded,
  *   before `$journal->settle()` skips it.
+ *
+ * `lane` makes the node a WAY IN for subjects that come back (`Lane`): no
+ * worker claims it; `$journal->arrive()` puts a subject in it,
+ * `$journal->settle()` lets it through, and each pass through what follows is
+ * archived when the next one enters.
  */
 final readonly class Node
 {
@@ -71,6 +76,7 @@ final readonly class Node
         public ?string $wait = null,
         public int|float|string|null $timeout = null,
         public int|float|string|null $grace = null,
+        public ?Lane $lane = null,
     ) {
         $this->parents = array_values($parents);
         $edges = [];

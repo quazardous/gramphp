@@ -24,7 +24,14 @@ follows [Semantic Versioning](https://semver.org/).
 - The MariaDB driver runs over PDO or over a Doctrine DBAL connection
   (`DbalSql`), so a Symfony application can share its own connection and
   transaction; the contract runs on both.
+- Lanes (`Lane`, `Node::$lane`, `LaneDriver`): `arrive`, `arrival`, `refs`,
+  and `settle` letting due arrivals in, the previous pass archived in the same
+  write; throttle, debounce, dedupe and batch presets, `maxWait`,
+  `whileRunning`, urgent arrivals, merge functions given to the journal
+  (`mergers`); `counts` and `snapshot` report `waiting` and `oldest_waiting`.
+  The MariaDB driver gains an arrivals table (`schema()`, `arrivals:`).
 - The items layer (`Items\Items`, `Items\Adapter`, `Items\ItemLease`):
   claim, conclude and pass-through calls in the application's own objects;
   ids and a driver's `Query` are loaded with `inflate`, once per call;
-  `applies` gives an optional node up, `branch` names a choice's way out.
+  `applies` gives an optional node up, `branch` names a choice's way out;
+  `arrive` sends items into a lane with their `refOf`.

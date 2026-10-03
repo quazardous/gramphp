@@ -4,12 +4,17 @@ declare(strict_types=1);
 
 namespace Quazardous\GramPHP\Driver\Mariadb;
 
+use Quazardous\GramPHP\Arrival;
 use Quazardous\GramPHP\Driver\CoreDriver;
+use Quazardous\GramPHP\Driver\LaneDriver;
 use Quazardous\GramPHP\Driver\NodeTimes;
 use Quazardous\GramPHP\Driver\ProgressMany;
 use Quazardous\GramPHP\Driver\ReadingDriver;
 use Quazardous\GramPHP\Entry;
 use Quazardous\GramPHP\Keyed;
+use Quazardous\GramPHP\Merge;
+use Quazardous\GramPHP\Outcome;
+use Quazardous\GramPHP\Position;
 use Quazardous\GramPHP\Reason;
 use Quazardous\GramPHP\Status;
 use Quazardous\GramPHP\Subject;
@@ -25,7 +30,8 @@ use Quazardous\GramPHP\Time;
  * expects — node rows (`(subject, node)` primary key), revisions (with each
  * subject's policy and pinned version), the history (an auto-increment id
  * gives back rows archived in one second in the order they were written),
- * and the limits table, whose rows `guard` locks.
+ * the limits table, whose rows `guard` locks, and the arrivals waiting in
+ * lanes.
  *
  * READ COMMITTED, IN A TRANSACTION. The driver never commits, and it REFUSES
  * what would void its guarantees:
@@ -56,11 +62,18 @@ use Quazardous\GramPHP\Time;
  * (error 1213, SQLSTATE 40001), rolls the transaction back, and the caller
  * retries it. Nothing is ever half-written.
  *
+ * HOW `enter` STAYS HONEST: lock first, check after. The revision rows are
+ * locked `FOR UPDATE` in a statement of their own — a claim writing on these
+ * subjects waits for this transaction, and finds the revision raised; a claim
+ * that came first holds its shared lock, and `enter` waits for its commit.
+ * The checks that follow start after the lock, so they see every claim
+ * committed before it: a pass running is never archived.
+ *
  * SUBJECTS COME BACK AS GIVEN: `subjectType` is the type of your ids, `'int'`
  * (a BIGINT column) or `'string'` (VARCHAR), and every subject read from the
  * tables is returned in that type.
  */
-final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, ProgressMany
+final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, ProgressMany, LaneDriver
 {
     /** Values bound per statement, at most. */
     private const CHUNK = 500;
@@ -83,8 +96,9 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
         private readonly string $history = 'grampy_history',
         private readonly string $limits = 'grampy_limits',
         private readonly string $subject = 'subject',
+        private readonly string $arrivals = 'grampy_arrivals',
     ) {
-        foreach ([$table, $revisions, $history, $limits, $subject] as $identifier) {
+        foreach ([$table, $revisions, $history, $limits, $subject, $arrivals] as $identifier) {
             self::checkIdentifier($identifier);
         }
         $this->sql = $connection instanceof Sql ? $connection : new PdoSql($connection);
@@ -104,8 +118,9 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
         string $history = 'grampy_history',
         string $limits = 'grampy_limits',
         string $subject = 'subject',
+        string $arrivals = 'grampy_arrivals',
     ): array {
-        foreach ([$table, $revisions, $history, $limits, $subject] as $identifier) {
+        foreach ([$table, $revisions, $history, $limits, $subject, $arrivals] as $identifier) {
             self::checkIdentifier($identifier);
         }
         $s = $subject . ' ' . ('int' === $subjectType ? 'BIGINT' : 'VARCHAR(255)') . ' NOT NULL';
@@ -123,6 +138,9 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
             . "finished_at {$time}, lease VARCHAR(191), archived_at {$time} NOT NULL, "
             . "reason VARCHAR(32) NOT NULL, KEY ({$subject}, node, reason, archived_at), KEY (archived_at)) ENGINE=InnoDB",
             "CREATE TABLE IF NOT EXISTS {$limits} (`key` VARCHAR(191) NOT NULL PRIMARY KEY, value DOUBLE) ENGINE=InnoDB",
+            "CREATE TABLE IF NOT EXISTS {$arrivals} ({$s}, node {$name} NOT NULL, ref VARCHAR(191), place {$time} NOT NULL, "
+            . "arrived_at {$time} NOT NULL, urgent TINYINT NOT NULL DEFAULT 0, refs MEDIUMTEXT, "
+            . "PRIMARY KEY ({$subject}, node), KEY (node, arrived_at)) ENGINE=InnoDB",
         ];
     }
 
@@ -495,6 +513,121 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
         }
 
         return $block();
+    }
+
+    // -- lanes -----------------------------------------------------------
+
+    /**
+     * One upsert per subject — atomic, so an arrival meeting the lane's door
+     * either waits behind its lock and is stored after it, or merges into the
+     * arrival still there. An insert reports 1 row, an update 2 (or 0 when
+     * nothing changed).
+     */
+    public function arrive(string $name, array $subjects, ?string $ref, string $now, string $merge, string $position, bool $urgent, ?string $refs = null): array
+    {
+        $this->requireTransaction();
+        $sets = ['urgent = GREATEST(urgent, VALUES(urgent))'];
+        if (\in_array($merge, [Merge::Last->value, Merge::Set->value], true)) {
+            $sets[] = 'ref = VALUES(ref)';
+        }
+        if (Merge::Set->value === $merge) {
+            $sets[] = 'refs = VALUES(refs)';
+        }
+        if (Position::Last->value === $position) {
+            $sets[] = 'place = VALUES(place)';
+        }
+        usort($subjects, static fn(int|string $a, int|string $b): int => strcmp((string) $a, (string) $b));
+        $out = [];
+        foreach ($subjects as $subject) {
+            $written = $this->sql->execute(
+                "INSERT INTO {$this->arrivals} ({$this->subject}, node, ref, place, arrived_at, urgent, refs) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                . 'ON DUPLICATE KEY UPDATE ' . implode(', ', $sets),
+                [$subject, $name, $ref, $now, $now, $urgent ? 1 : 0, $refs],
+            );
+            $out[Subject::key($subject)] = 1 === $written ? Outcome::Queued->value : Outcome::Merged->value;
+        }
+
+        return $out;
+    }
+
+    public function arrivals(array $subjects, string $name): array
+    {
+        $out = [];
+        foreach (array_chunk($subjects, self::CHUNK) as $chunk) {
+            $rows = $this->sql->select(
+                "SELECT {$this->subject}, ref, place, arrived_at, urgent, refs FROM {$this->arrivals} "
+                . "WHERE node = ? AND {$this->subject} IN (" . self::marks($chunk) . ')',
+                [$name, ...$chunk],
+            );
+            foreach ($rows as [$subject, $ref, $place, $arrived, $urgent, $refs]) {
+                $out[Subject::key($this->cast($subject))] = new Arrival(
+                    self::textOrNull($ref),
+                    self::text($place),
+                    self::text($arrived),
+                    0 !== self::integer($urgent),
+                    self::textOrNull($refs),
+                );
+            }
+        }
+
+        return $out;
+    }
+
+    /** Lock first — the revisions, then the arrivals — check after. */
+    public function enter(string $name, array $entries, array $archive, string $now): array
+    {
+        $this->requireTransaction();
+        if ([] === $entries || [] === $archive) {
+            return [];
+        }
+        usort($entries, static fn(array $a, array $b): int => strcmp((string) $a[0], (string) $b[0]));
+        $entered = [];
+        foreach ($entries as [$subject, $revision]) {
+            $this->sql->execute("INSERT IGNORE INTO {$this->revisions} ({$this->subject}, revision) VALUES (?, 0)", [$subject]);
+            $current = $this->scalar("SELECT revision FROM {$this->revisions} WHERE {$this->subject} = ? FOR UPDATE", [$subject]);
+            if (self::integer($current) !== $revision) {
+                continue;
+            }
+            $arrival = $this->sql->select(
+                "SELECT ref, arrived_at FROM {$this->arrivals} WHERE {$this->subject} = ? AND node = ? FOR UPDATE",
+                [$subject, $name],
+            )[0] ?? null;
+            if (null === $arrival) {
+                continue;
+            }
+            $busy = $this->scalar(
+                "SELECT COUNT(*) FROM {$this->table} WHERE {$this->subject} = ? AND node IN (" . self::marks($archive) . ') AND status IN (?, ?)',
+                [$subject, ...$archive, Status::Running->value, Status::Scheduled->value],
+            );
+            if (0 !== self::integer($busy)) {
+                continue;
+            }
+            [$ref, $arrived] = [self::textOrNull($arrival[0] ?? null), self::text($arrival[1] ?? null)];
+            $this->raiseRevision($subject);
+            $this->takeAway("{$this->subject} = ? AND node IN (" . self::marks($archive) . ')', [$subject, ...$archive], $now, Reason::Arrival->value);
+            $this->sql->execute("DELETE FROM {$this->arrivals} WHERE {$this->subject} = ? AND node = ?", [$subject, $name]);
+            $this->sql->execute(
+                "INSERT INTO {$this->history} ({$this->subject}, " . self::COLUMNS . ', archived_at, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                [$subject, $name, Outcome::Entered->value, $arrived, $now, $ref, $now, Reason::Lane->value],
+            );
+            $this->sql->execute(
+                "INSERT INTO {$this->table} ({$this->subject}, node, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?)",
+                [$subject, $name, Status::Done->value, $arrived, $now],
+            );
+            $entered[] = $subject;
+        }
+
+        return $entered;
+    }
+
+    public function queued(string $name): int
+    {
+        return self::integer($this->scalar("SELECT COUNT(*) FROM {$this->arrivals} WHERE node = ?", [$name]));
+    }
+
+    public function waitingSince(string $name): ?string
+    {
+        return self::textOrNull($this->scalar("SELECT MIN(arrived_at) FROM {$this->arrivals} WHERE node = ?", [$name]));
     }
 
     // -- inside ----------------------------------------------------------

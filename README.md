@@ -100,6 +100,39 @@ A transaction mixing several claims and forgets on the same subjects can
 meet a deadlock: InnoDB reports it (error 1213, SQLSTATE 40001), rolls the
 transaction back, and the caller retries it — nothing is ever half-written.
 
+## Lanes: subjects that come back
+
+A subject often comes back — a listing updated again, a file re-uploaded.
+A **lane** is the node it comes back through: it waits there, merges with
+the version already waiting, and `settle` lets it in once due, archiving the
+previous pass in the same write.
+
+```php
+use Quazardous\GramPHP\Lane;
+
+$journal = new NodeJournal($driver, new Dag(
+    new Node('arrive', lane: Lane::throttle(cooldown: '1h')),
+    new Node('scrape', parents: ['arrive']),
+    new Node('publish', parents: ['scrape']),
+));
+
+$journal->arrive('arrive', [42], ref: 'v7');     // ['queued' => 1, 'merged' => 0, 'skipped' => 0]
+$journal->settle($candidates);                   // ['arrive' => ['entered' => 1]] once due
+```
+
+| preset | keeps | place | under the names other tools gave it |
+|---|---|---|---|
+| `Lane::throttle($cooldown)` | the last ref | the first's | throttle |
+| `Lane::debounce($delay)` | the last ref | to the back | debounce |
+| `Lane::dedupe()` | the first ref | the first's | dedupe |
+| `Lane::batch(maxSize: 100)` | every ref, in order | the first's | aggregator |
+
+`maxWait` bounds the wait whatever the rest, `whileRunning: WhileRunning::Skip`
+drops an arrival while a pass runs, `urgent: true` skips the cooldown — never
+a running pass. A lane may also merge with a function of yours, named in the
+graph (`Merge::fn('ends')`) and given to the journal (`mergers: ['ends' => $fn]`).
+Every merge, drop and entry is noted in the history.
+
 ## Items: speak objects, not ids
 
 The core works on ids and knows nothing about your data. The optional items
@@ -154,14 +187,15 @@ could take now) and `oldest_ready` (starvation).
 
 Ported so far: the graph and its claim rule, joins (`on`, `need`), choices,
 loops, retries, leases, waits and signals, grace, skip, adopt, forget,
-release, the history, counts, stages and snapshots, and the items layer —
-with the memory and MariaDB drivers, both certified by the shared contract,
+release, the history, counts, stages and snapshots, lanes (throttle,
+debounce, dedupe, batch, merge functions) and the items layer — with the
+memory and MariaDB drivers, both certified by the shared contract,
 concurrency included.
 
-Still to port from grampy: groups, rate limits and concurrency caps,
-policies, lanes (throttle, debounce, dedupe, batch), graph versions and
-migration, and the diagram. The items layer gains `arrive` / `refOf` with
-lanes and `groupOf` with groups.
+Still to port from grampy: groups, rate limits and concurrency caps (a
+lane's door gains its `rate` with them), policies (a policy tuning a lane
+with them), graph versions and migration, and the diagram. The items layer
+gains `groupOf` with groups.
 
 ## Development
 

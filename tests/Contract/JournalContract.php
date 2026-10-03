@@ -8,14 +8,19 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Quazardous\GramPHP\Dag;
 use Quazardous\GramPHP\DagError;
+use Quazardous\GramPHP\Driver\LaneDriver;
+use Quazardous\GramPHP\Lane;
 use Quazardous\GramPHP\Lease;
+use Quazardous\GramPHP\Merge;
 use Quazardous\GramPHP\Node;
 use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Outcome;
+use Quazardous\GramPHP\Position;
 use Quazardous\GramPHP\Reason;
 use Quazardous\GramPHP\Retry;
 use Quazardous\GramPHP\Status;
 use Quazardous\GramPHP\Time;
+use Quazardous\GramPHP\WhileRunning;
 
 /**
  * THE DRIVER CONTRACT — one suite, every driver.
@@ -51,10 +56,13 @@ abstract class JournalContract extends TestCase
 
     // -- helpers ---------------------------------------------------------
 
-    /** @param 'int'|'string' $subjectType */
-    private function journal(?Dag $dag = null, string $subjectType = 'string'): NodeJournal
+    /**
+     * @param 'int'|'string'                                             $subjectType
+     * @param array<string, callable(list<string>, ?string): iterable<string>> $mergers
+     */
+    private function journal(?Dag $dag = null, string $subjectType = 'string', array $mergers = []): NodeJournal
     {
-        return $this->harness->journal($dag ?? Graphs::diamond(), $this->clock, $subjectType);
+        return $this->harness->journal($dag ?? Graphs::diamond(), $this->clock, $subjectType, $mergers);
     }
 
     /** @param list<int|string> $subjects */
@@ -803,6 +811,300 @@ abstract class JournalContract extends TestCase
         self::assertSame(['call', 'prepare'], array_map(static fn(array $r): string => $r['node'], $journal->history($big)));
     }
 
+    // -- lanes -----------------------------------------------------------
+
+    /** @param list<int|string> $subjects */
+    private function letIn(NodeJournal $journal, array $subjects): int
+    {
+        return $journal->settle($this->harness->candidates($subjects))['arrive'][Outcome::Entered->value] ?? 0;
+    }
+
+    /**
+     * One whole pass after the lane: scrape, then publish.
+     *
+     * @param list<int|string> $subjects
+     */
+    private function through(NodeJournal $journal, array $subjects): void
+    {
+        $this->work($journal, 'scrape', $subjects);
+        $this->work($journal, 'publish', $subjects);
+    }
+
+    /** @return list<?string> the refs the history notes with this status */
+    private static function noted(NodeJournal $journal, int|string $subject, Outcome $status): array
+    {
+        return array_values(array_map(
+            static fn(array $row): ?string => $row['lease'],
+            array_filter($journal->history($subject), static fn(array $row): bool => $status->value === $row['status']),
+        ));
+    }
+
+    public function testAnArrivalWaitsInItsLaneUntilSettled(): void
+    {
+        $journal = $this->journal(Graphs::listing());
+        self::assertSame(['queued' => 1, 'merged' => 0, 'skipped' => 0], $journal->arrive('arrive', ['s1'], 'v1'));
+        self::assertSame([], $journal->progress('s1'));
+        self::assertTaken([], $this->claim($journal, 'scrape', ['s1']));
+        self::assertSame(1, $journal->counts('arrive')['waiting']);
+        self::assertSame('v1', $journal->arrival('s1', 'arrive')?->ref);
+        self::assertSame(1, $this->letIn($journal, ['s1']));
+        self::assertProgress(['arrive' => Status::Done], $journal, 's1');
+        self::assertNull($journal->arrival('s1', 'arrive'));
+        self::assertSame(0, $journal->counts('arrive')['waiting']);
+        self::assertTaken(['s1'], $this->claim($journal, 'scrape', ['s1']));
+        $history = $journal->history('s1');
+        self::assertCount(1, $history);
+        self::assertSame(['arrive', 'entered', 'v1', 'lane'], [$history[0]['node'], $history[0]['status'], $history[0]['lease'], $history[0]['reason']]);
+    }
+
+    public function testALaneIsNeverClaimedAndOnlyALaneTakesArrivals(): void
+    {
+        $journal = $this->journal(Graphs::listing());
+        self::assertThrows(fn() => $this->claim($journal, 'arrive', ['s1']), \InvalidArgumentException::class, 'lane');
+        self::assertThrows(static fn() => $journal->arrive('scrape', ['s1']), \InvalidArgumentException::class, 'not a lane');
+    }
+
+    public function testThrottleKeepsTheLastVersionAtThePlaceOfTheFirst(): void
+    {
+        $journal = $this->journal(Graphs::listing());
+        $journal->arrive('arrive', ['s1'], 'v1');
+        $this->clock->now = self::at(5);
+        self::assertSame(1, $journal->arrive('arrive', ['s1'], 'v2')['merged']);
+        $waiting = $journal->arrival('s1', 'arrive');
+        self::assertNotNull($waiting);
+        self::assertSame(['v2', self::at(0), self::at(0)], [$waiting->ref, $waiting->place, $waiting->arrivedAt]);
+        self::assertSame(['v2'], self::noted($journal, 's1', Outcome::Merged));
+    }
+
+    public function testDedupeKeepsTheFirstVersion(): void
+    {
+        $journal = $this->journal(Graphs::listing(new Lane(Merge::First)));
+        $journal->arrive('arrive', ['s1'], 'v1');
+        $this->clock->now = self::at(5);
+        $journal->arrive('arrive', ['s1'], 'v2');
+        self::assertSame('v1', $journal->arrival('s1', 'arrive')?->ref);
+    }
+
+    public function testBatchKeepsEveryVersionInTheOrderTheyCame(): void
+    {
+        $journal = $this->journal(Graphs::listing(new Lane(Merge::All)));
+        foreach (['v1', 'v2', 'v3'] as $minute => $ref) {
+            $this->clock->now = self::at($minute);
+            $journal->arrive('arrive', ['s1'], $ref);
+        }
+        self::assertSame(['v1', 'v2', 'v3'], $journal->refs('s1', 'arrive'));
+        self::assertSame('v3', $journal->arrival('s1', 'arrive')?->ref, 'the latest is still named');
+    }
+
+    public function testABatchPastItsSizeLetsTheOldestGoAndSaysSo(): void
+    {
+        $journal = $this->journal(Graphs::listing(new Lane(Merge::All, maxSize: 2)));
+        foreach (['v1', 'v2', 'v3'] as $minute => $ref) {
+            $this->clock->now = self::at($minute);
+            $journal->arrive('arrive', ['s1'], $ref);
+        }
+        self::assertSame(['v2', 'v3'], $journal->refs('s1', 'arrive'), 'the oldest was let go');
+        self::assertSame(['v1'], self::noted($journal, 's1', Outcome::Dropped), 'and it left a trace');
+    }
+
+    /** @var list<array{0: list<string>, 1: ?string}> what a merge function was asked */
+    private array $asked = [];
+
+    /**
+     * Keep the first and the latest version, nothing in between.
+     *
+     * @param list<string> $kept
+     *
+     * @return list<string>
+     */
+    private function keepTheEnds(array $kept, ?string $arriving): array
+    {
+        $this->asked[] = [$kept, $arriving];
+        $whole = [...$kept, (string) $arriving];
+
+        return \count($whole) > 2 ? [$whole[0], $whole[\count($whole) - 1]] : $whole;
+    }
+
+    public function testANamedFunctionDecidesWhatTheLaneKeeps(): void
+    {
+        // The graph holds the NAME; the journal holds the function.
+        $journal = $this->journal(Graphs::listing(new Lane(Merge::fn('ends'))), mergers: ['ends' => $this->keepTheEnds(...)]);
+        foreach (['v1', 'v2', 'v3', 'v4'] as $minute => $ref) {
+            $this->clock->now = self::at($minute);
+            $journal->arrive('arrive', ['s1'], $ref);
+        }
+        self::assertSame(['v1', 'v4'], $journal->refs('s1', 'arrive'));
+        self::assertSame([[], 'v1'], $this->asked[0], 'asked with what waits and what arrives');
+        self::assertSame([['v1', 'v3'], 'v4'], $this->asked[\count($this->asked) - 1]);
+    }
+
+    public function testALaneNamingAFunctionTheJournalLacksSaysWhich(): void
+    {
+        $journal = $this->journal(Graphs::listing(new Lane(Merge::fn('nowhere'))));
+        self::assertThrows(static fn() => $journal->arrive('arrive', ['s1'], 'v1'), \InvalidArgumentException::class, 'nowhere');
+    }
+
+    public function testDebounceWaitsForQuietAndMaxWaitEndsIt(): void
+    {
+        $journal = $this->journal(Graphs::listing(new Lane(position: Position::Last, delay: '10m', maxWait: '25m')));
+        foreach ([0, 5, 10] as $minute) {
+            $this->clock->now = self::at($minute);
+            $journal->arrive('arrive', ['s1'], "v{$minute}");
+        }
+        self::assertSame(self::at(10), $journal->arrival('s1', 'arrive')?->place);
+        $this->clock->now = self::at(19);
+        self::assertSame(0, $this->letIn($journal, ['s1']), 'quiet since 10, not 10 minutes yet');
+        $this->clock->now = self::at(15);
+        $journal->arrive('arrive', ['s1'], 'v15');
+        $this->clock->now = self::at(24);
+        self::assertSame(0, $this->letIn($journal, ['s1']));
+        $this->clock->now = self::at(25);
+        self::assertSame(1, $this->letIn($journal, ['s1']), 'maxWait from the first arrival');
+        $history = $journal->history('s1');
+        self::assertSame('v15', $history[\count($history) - 1]['lease']);
+    }
+
+    public function testCooldownRunsFromTheEndOfThePreviousPass(): void
+    {
+        $journal = $this->journal(Graphs::listing());
+        $journal->arrive('arrive', ['s1'], 'v1');
+        self::assertSame(1, $this->letIn($journal, ['s1']), 'no previous pass, no cooldown');
+        $this->clock->now = self::at(30);
+        $this->through($journal, ['s1']);
+        $this->clock->now = self::at(40);
+        $journal->arrive('arrive', ['s1'], 'v2');
+        $this->clock->now = self::at(89);
+        self::assertSame(0, $this->letIn($journal, ['s1']), 'the pass ended at 30');
+        self::assertProgress(['arrive' => Status::Done, 'scrape' => Status::Done, 'publish' => Status::Done], $journal, 's1', 'the previous pass stays visible while the next version waits');
+        $this->clock->now = self::at(90);
+        self::assertSame(1, $this->letIn($journal, ['s1']));
+        self::assertProgress(['arrive' => Status::Done], $journal, 's1');
+        $archived = array_map(
+            static fn(array $row): string => $row['node'] . ':' . $row['status'],
+            array_values(array_filter($journal->history('s1'), static fn(array $row): bool => Reason::Arrival->value === $row['reason'])),
+        );
+        sort($archived);
+        self::assertSame(['arrive:done', 'publish:done', 'scrape:done'], $archived);
+        self::assertTaken(['s1'], $this->claim($journal, 'scrape', ['s1']));
+    }
+
+    public function testAnArrivalDuringARunningPassWaitsForIt(): void
+    {
+        $journal = $this->journal(Graphs::listing(new Lane()));
+        $journal->arrive('arrive', ['s1'], 'v1');
+        $this->letIn($journal, ['s1']);
+        $lease = $this->claim($journal, 'scrape', ['s1']);
+        $journal->arrive('arrive', ['s1'], 'v2');
+        self::assertSame(0, $this->letIn($journal, ['s1']), 'scrape is running');
+        $journal->conclude('scrape', $lease, $lease->token);
+        self::assertSame(1, $this->letIn($journal, ['s1']));
+        self::assertProgress(['arrive' => Status::Done], $journal, 's1');
+    }
+
+    public function testTheDriverNeverLetsAnArrivalInOverARunningPass(): void
+    {
+        // What the journal checks before, the driver holds on its own: a
+        // claim may land between the journal's read and the write.
+        $journal = $this->journal(Graphs::listing(new Lane()));
+        $driver = $journal->driver;
+        self::assertInstanceOf(LaneDriver::class, $driver);
+        $journal->arrive('arrive', ['s1'], 'v1');
+        $this->letIn($journal, ['s1']);
+        $this->claim($journal, 'scrape', ['s1']);
+        $journal->arrive('arrive', ['s1'], 'v2');
+        $entries = [];
+        foreach ($driver->scan($this->harness->candidates(['s1']), null, ['arrive', 'scrape', 'publish'], [], 10, self::at(0)) as $page) {
+            array_push($entries, ...$page);
+        }
+        self::assertCount(1, $entries);
+        $revision = $entries[0]->revision;
+        self::assertSame([], $driver->enter('arrive', [['s1', $revision]], ['arrive', 'scrape', 'publish'], self::at(0)));
+        self::assertSame([], $driver->enter('arrive', [['s1', $revision + 1]], ['arrive'], self::at(0)), 'stale revision');
+        self::assertProgress(['arrive' => Status::Done, 'scrape' => Status::Running], $journal, 's1');
+        self::assertSame([], $driver->enter('scrape', [['s1', $revision]], ['scrape'], self::at(0)), 'nothing waits there');
+    }
+
+    public function testSkipDropsAnArrivalDuringARunningPass(): void
+    {
+        $journal = $this->journal(Graphs::listing(new Lane(whileRunning: WhileRunning::Skip)));
+        $journal->arrive('arrive', ['s1'], 'v1');
+        $this->letIn($journal, ['s1']);
+        $this->claim($journal, 'scrape', ['s1']);
+        self::assertSame(['queued' => 0, 'merged' => 0, 'skipped' => 1], $journal->arrive('arrive', ['s1'], 'v2'));
+        self::assertNull($journal->arrival('s1', 'arrive'));
+        self::assertSame(['v2'], self::noted($journal, 's1', Outcome::Skipped));
+    }
+
+    public function testAnUrgentArrivalSkipsTheCooldownButNotARunningPass(): void
+    {
+        $journal = $this->journal(Graphs::listing());
+        $journal->arrive('arrive', ['s1'], 'v1');
+        $this->letIn($journal, ['s1']);
+        $lease = $this->claim($journal, 'scrape', ['s1']);
+        $journal->arrive('arrive', ['s1'], 'v2');
+        $journal->arrive('arrive', ['s1'], 'v3', urgent: true);
+        self::assertTrue($journal->arrival('s1', 'arrive')?->urgent);
+        self::assertSame(0, $this->letIn($journal, ['s1']));
+        $journal->conclude('scrape', $lease, $lease->token);
+        $this->clock->now = self::at(1);
+        self::assertSame(1, $this->letIn($journal, ['s1']), 'urgent: no hour of cooldown');
+    }
+
+    public function testALaneAfterOtherNodesWaitsForItsParents(): void
+    {
+        $journal = $this->journal(new Dag(
+            new Node('fetch'),
+            new Node('tag', parents: ['fetch'], lane: new Lane()),
+            new Node('index', parents: ['tag']),
+        ));
+        $journal->arrive('tag', ['s1']);
+        self::assertSame([], $journal->settle($this->harness->candidates(['s1'])));
+        $this->work($journal, 'fetch', ['s1']);
+        self::assertSame(['tag' => ['entered' => 1]], $journal->settle($this->harness->candidates(['s1'])));
+        self::assertProgress(['fetch' => Status::Done, 'tag' => Status::Done], $journal, 's1');
+    }
+
+    public function testBoundedSettlesLetALaneInByParts(): void
+    {
+        $subjects = array_map(static fn(int $i): string => "s{$i}", range(0, 4));
+        $build = function () use ($subjects): NodeJournal {
+            $journal = $this->journal(Graphs::listing(new Lane()));
+            $journal->arrive('arrive', $subjects);
+
+            return $journal;
+        };
+        $whole = $build();
+        self::assertSame(5, $this->letIn($whole, $subjects));
+        $passes = $build();
+        self::assertSame([2, 2, 1, 0], self::bounded(fn(): int => $passes->settle($this->harness->candidates($subjects), 2)['arrive'][Outcome::Entered->value] ?? 0, 2));
+        foreach ($subjects as $subject) {
+            self::assertEquals($whole->progress($subject), $passes->progress($subject));
+        }
+        self::assertSame(0, $passes->counts('arrive')['waiting']);
+    }
+
+    public function testASnapshotAgesALanesOldestArrival(): void
+    {
+        $journal = $this->journal(Graphs::listing());
+        $journal->arrive('arrive', ['s1', 's2']);
+        $this->clock->now = self::at(5);
+        $snapshot = $journal->snapshot($this->harness->candidates(['s1', 's2']));
+        self::assertSame(2, $snapshot['arrive']['waiting']);
+        self::assertEquals(300, $snapshot['arrive']['oldest_waiting']);
+        self::assertArrayNotHasKey('ready', $snapshot['arrive'], 'a lane is settled, never claimed');
+    }
+
+    public function testIntegerSubjectsWaitInALaneAsIntegers(): void
+    {
+        $journal = $this->journal(Graphs::listing(new Lane(Merge::All)), 'int');
+        $big = 2 ** 40;
+        $journal->arrive('arrive', [$big, 7], 'v1');
+        $journal->arrive('arrive', [$big], 'v2');
+        self::assertSame(['v1', 'v2'], $journal->refs($big, 'arrive'));
+        self::assertSame(2, $this->letIn($journal, [$big, 7]));
+        self::assertTaken([7, $big], $this->claim($journal, 'scrape', [$big, 7]));
+    }
+
     // -- concurrency -----------------------------------------------------
     //
     // SAID IN SESSIONS, NOT IN LOCKS. A session is one unit of work on shared
@@ -881,6 +1183,122 @@ abstract class JournalContract extends TestCase
             };
             self::processes([self::claimer($store, ['start', 'left'], $subjects), self::claimer($store, ['right', 'end'], $subjects), self::claimer($store, ['left', 'end', 'start'], $subjects), $janitor]);
             self::assertNoOrphan($store, $subjects);
+        } finally {
+            $store->close();
+        }
+    }
+
+    public function testTwoVersionsArrivingAtOnceAreBothKept(): void
+    {
+        // A lane keeping every version reads what waits, merges, then writes:
+        // two arrivals at once would each start from the state before the
+        // other. The journal merges under the driver's guard.
+        $store = $this->store(Graphs::listing(new Lane(Merge::All, maxSize: 10)));
+        try {
+            $one = $store->session();
+            $one->journal()->arrive('arrive', ['s1'], 'v1');
+            self::race(
+                static function () use ($store): void {
+                    self::unit($store, static fn(Session $s): array => $s->journal()->arrive('arrive', ['s1'], 'v2'));
+                },
+                static fn() => $one->commit(),
+            );
+            $check = $store->session();
+            try {
+                self::assertSame(['v1', 'v2'], $check->journal()->refs('s1', 'arrive'), 'both versions waited, neither overwrote the other');
+            } finally {
+                $check->rollback();
+            }
+        } finally {
+            $store->close();
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function firsts(): iterable
+    {
+        yield 'the first holds' => ['first'];
+        yield 'the second holds' => ['second'];
+    }
+
+    /**
+     * The lane lets v2 in — archiving the pass — while a worker claims
+     * `publish` on the strength of that pass. Whoever writes first, a claim
+     * granted is never archived under the worker's feet.
+     */
+    #[DataProvider('firsts')]
+    public function testALaneNeverLetsAVersionInOverAClaim(string $first): void
+    {
+        $dag = Graphs::listing(new Lane());
+        $store = $this->store($dag);
+        try {
+            $setup = $store->session();
+            $setup->journal()->arrive('arrive', ['s1'], 'v1');
+            $setup->journal()->settle($setup->candidates(['s1']));
+            $lease = $setup->journal()->claim('scrape', 1, $setup->candidates(['s1']));
+            $setup->journal()->conclude('scrape', $lease, $lease->token);
+            $setup->journal()->arrive('arrive', ['s1'], 'v2');
+            $setup->commit();
+
+            $claim = static fn(Session $s): Lease => $s->journal()->claim('publish', 1, $s->candidates(['s1']));
+            $letIn = static fn(Session $s): array => $s->journal()->settle($s->candidates(['s1']));
+            $held = $store->session();
+            ('first' === $first ? $claim : $letIn)($held);
+            $other = 'first' === $first ? $letIn : $claim;
+            self::race(
+                static function () use ($store, $other): void {
+                    self::unit($store, $other);
+                },
+                static fn() => $held->commit(),
+            );
+            self::assertNoOrphan($store, ['s1'], $dag);
+            $check = $store->session();
+            try {
+                $progress = $check->journal()->progress('s1');
+                if (isset($progress['publish'])) {
+                    // The claim won: the pass it stands on must still be there.
+                    self::assertSame(Status::Running, $progress['publish'], 'the lane archived a pass while a worker held publish');
+                    self::assertNotNull($check->journal()->arrival('s1', 'arrive'), 'v2 still waits for the pass to end');
+                } else {
+                    // The lane won: v2 entered, and the claim took nothing.
+                    self::assertSame(['arrive' => Status::Done], $progress);
+                }
+            } finally {
+                $check->rollback();
+            }
+        } finally {
+            $store->close();
+        }
+    }
+
+    #[DataProvider('firsts')]
+    public function testAVersionArrivingAsTheLaneLetsOneInIsNeverLost(string $first): void
+    {
+        $store = $this->store(Graphs::listing(new Lane()));
+        try {
+            $setup = $store->session();
+            $setup->journal()->arrive('arrive', ['s1'], 'v1');
+            $setup->commit();
+
+            $arrive = static fn(Session $s): array => $s->journal()->arrive('arrive', ['s1'], 'v2');
+            $letIn = static fn(Session $s): array => $s->journal()->settle($s->candidates(['s1']));
+            $held = $store->session();
+            ('first' === $first ? $arrive : $letIn)($held);
+            $other = 'first' === $first ? $letIn : $arrive;
+            self::race(
+                static function () use ($store, $other): void {
+                    self::unit($store, $other);
+                },
+                static fn() => $held->commit(),
+            );
+            $check = $store->session();
+            try {
+                $waiting = $check->journal()->arrival('s1', 'arrive');
+                $kept = [...self::noted($check->journal(), 's1', Outcome::Entered), ...(null === $waiting ? [] : [$waiting->ref])];
+                self::assertContains('v2', $kept, 'v2 was lost');
+            } finally {
+                $check->rollback();
+            }
         } finally {
             $store->close();
         }
@@ -1070,11 +1488,11 @@ abstract class JournalContract extends TestCase
      *
      * @param list<int|string> $subjects
      */
-    private static function assertNoOrphan(Store $store, array $subjects): void
+    private static function assertNoOrphan(Store $store, array $subjects, ?Dag $dag = null): void
     {
         $session = $store->session();
         try {
-            $dag = Graphs::diamond();
+            $dag ??= Graphs::diamond();
             $orphans = [];
             foreach ($subjects as $subject) {
                 $progress = $session->journal()->progress($subject);
