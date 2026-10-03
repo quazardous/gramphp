@@ -7,6 +7,7 @@ namespace Quazardous\GramPHP\Tests\Driver;
 use Quazardous\GramPHP\Dag;
 use Quazardous\GramPHP\Driver\Mariadb\MariadbDriver;
 use Quazardous\GramPHP\Driver\Mariadb\Query;
+use Quazardous\GramPHP\Driver\Mariadb\Transaction;
 use Quazardous\GramPHP\Graph;
 use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Status;
@@ -221,19 +222,10 @@ final class MariadbHarness implements Harness
         };
     }
 
-    /** A deadlock or lock conflict InnoDB asks to retry: SQLSTATE 40001, error 1213. */
+    /** A deadlock InnoDB asks to retry — the shipped helper's own test. */
     public static function isDeadlock(\Throwable $e): bool
     {
-        for ($cause = $e; null !== $cause; $cause = $cause->getPrevious()) {
-            if ($cause instanceof \Doctrine\DBAL\Exception\RetryableException) {
-                return true;
-            }
-            if ($cause instanceof \PDOException && ('40001' === (string) $cause->getCode() || 1213 === ($cause->errorInfo[1] ?? null))) {
-                return true;
-            }
-        }
-
-        return false;
+        return Transaction::isRetryable($e);
     }
 
     public function close(): void

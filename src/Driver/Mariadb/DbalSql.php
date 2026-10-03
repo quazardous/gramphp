@@ -40,6 +40,21 @@ final class DbalSql implements Sql
         return (int) $this->connection->executeStatement($sql, $params);
     }
 
+    public function begin(): void
+    {
+        $this->connection->beginTransaction();
+    }
+
+    public function commit(): void
+    {
+        $this->connection->commit();
+    }
+
+    public function rollBack(): void
+    {
+        $this->connection->rollBack();
+    }
+
     public function inTransaction(): bool
     {
         return $this->connection->isTransactionActive();

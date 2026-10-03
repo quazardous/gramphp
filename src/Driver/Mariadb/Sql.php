@@ -7,8 +7,10 @@ namespace Quazardous\GramPHP\Driver\Mariadb;
 /**
  * WHAT THE MARIADB DRIVER NEEDS OF A CONNECTION: run a statement with
  * positional `?` parameters, read its rows, tell how many rows it changed, and
- * say whether a transaction is open. Nothing else — the driver never begins,
- * commits or rolls back: the application does, around each journal call.
+ * say whether a transaction is open. The driver never begins, commits or
+ * rolls back: the application does, around each journal call — by hand, or
+ * with `Transaction`, which also retries a unit InnoDB rolled back on a
+ * deadlock.
  *
  * Two implementations ship: `PdoSql` (a PDO connection) and `DbalSql` (a
  * Doctrine DBAL connection, to share the one a Symfony application already
@@ -46,4 +48,11 @@ interface Sql
 
     /** True when a transaction is open on the connection. */
     public function inTransaction(): bool;
+
+    /** Open a transaction — `Transaction` does; the driver never does. */
+    public function begin(): void;
+
+    public function commit(): void;
+
+    public function rollBack(): void;
 }

@@ -34,6 +34,21 @@ final class PdoSql implements Sql
         return $this->run($sql, $params)->rowCount();
     }
 
+    public function begin(): void
+    {
+        $this->pdo->beginTransaction();
+    }
+
+    public function commit(): void
+    {
+        $this->pdo->commit();
+    }
+
+    public function rollBack(): void
+    {
+        $this->pdo->rollBack();
+    }
+
     public function inTransaction(): bool
     {
         return $this->pdo->inTransaction();

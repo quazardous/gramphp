@@ -99,6 +99,18 @@ $lease = $connection->transactional(fn() => $journal->claim('ship', 50, $candida
 A transaction mixing several claims and forgets on the same subjects can
 meet a deadlock: InnoDB reports it (error 1213, SQLSTATE 40001), rolls the
 transaction back, and the caller retries it — nothing is ever half-written.
+`Transaction` does exactly that, over PDO or DBAL:
+
+```php
+use Quazardous\GramPHP\Driver\Mariadb\Transaction;
+
+$lease = (new Transaction($pdo))->run(fn() => $journal->claim('ship', 50, $candidates));
+```
+
+It begins, runs the unit, commits; on a deadlock it runs the unit again from
+a fresh transaction, after a short random pause, at most `attempts` times.
+Anything else is rolled back and thrown as it came. The unit must be safe to
+run again — keep mails and calls after `run` returns.
 
 ## Policies: one workflow, several ways of pushing it
 

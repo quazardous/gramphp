@@ -24,6 +24,9 @@ follows [Semantic Versioning](https://semver.org/).
 - The MariaDB driver runs over PDO or over a Doctrine DBAL connection
   (`DbalSql`), so a Symfony application can share its own connection and
   transaction; the contract runs on both.
+- `Driver\Mariadb\Transaction`: runs a unit in a transaction and retries it
+  when InnoDB rolls it back on a deadlock (1213 / 40001), over PDO or DBAL;
+  `Sql` gains `begin`, `commit` and `rollBack`, which only it calls.
 - The graph as data: `Graph::toArray()` / `toJson()` write one canonical
   form, grampy's own (`grampy/1`, the same file in either implementation);
   `fromArray()` / `fromJson()` read it strictly, a lie refused with its path
