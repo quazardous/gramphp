@@ -103,6 +103,32 @@ final readonly class Node
         $this->on = $edges;
     }
 
+    /**
+     * This node with some settings changed — what a policy sees.
+     *
+     * @param array<string, mixed> $settings constructor argument => value
+     */
+    public function with(array $settings): self
+    {
+        $args = [
+            'name' => $this->name, 'parents' => $this->parents, 'working' => $this->working, 'state' => $this->state,
+            'optional' => $this->optional, 'once' => $this->once, 'on' => $this->on, 'need' => $this->need,
+            'choice' => $this->choice, 'loop' => $this->loop, 'retry' => $this->retry, 'lease' => $this->lease,
+            'wait' => $this->wait, 'timeout' => $this->timeout, 'grace' => $this->grace, 'lane' => $this->lane,
+            'rate' => $this->rate, 'concurrency' => $this->concurrency, 'per' => $this->per, 'group' => $this->group,
+        ];
+        foreach ($settings as $key => $value) {
+            if (!\array_key_exists($key, $args)) {
+                throw new \InvalidArgumentException(\sprintf("a node has no setting '%s'", $key));
+            }
+            $args[$key] = $value;
+        }
+
+        // The values are checked by the constructor's own types: a wrong one
+        // raises a TypeError naming it.
+        return (new \ReflectionClass(self::class))->newInstanceArgs($args);
+    }
+
     /** True when a claim on this node is cut by a rate or a concurrency. */
     public function limited(): bool
     {

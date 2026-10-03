@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Quazardous\GramPHP\Tests\Contract;
 
 use Quazardous\GramPHP\Dag;
+use Quazardous\GramPHP\Graph;
 use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Status;
 
@@ -21,7 +22,7 @@ interface Harness
      * @param 'int'|'string'                                             $subjectType
      * @param array<string, callable(list<string>, ?string): iterable<string>> $mergers
      */
-    public function journal(Dag $dag, callable $clock, string $subjectType = 'string', array $mergers = []): NodeJournal;
+    public function journal(Graph|Dag $dag, callable $clock, string $subjectType = 'string', array $mergers = []): NodeJournal;
 
     /**
      * The driver's candidates, in this order.
@@ -52,7 +53,7 @@ interface Harness
      *
      * @param callable(): (string|\DateTimeInterface) $clock
      */
-    public function store(Dag $dag, callable $clock): ?Store;
+    public function store(Graph|Dag $dag, callable $clock): ?Store;
 
     /** Drop what the harness created. */
     public function close(): void;

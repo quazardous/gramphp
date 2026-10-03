@@ -7,6 +7,7 @@ namespace Quazardous\GramPHP\Tests\Driver;
 use Quazardous\GramPHP\Dag;
 use Quazardous\GramPHP\Driver\Memory\MemoryDriver;
 use Quazardous\GramPHP\Driver\Memory\Row;
+use Quazardous\GramPHP\Graph;
 use Quazardous\GramPHP\Keyed;
 use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Status;
@@ -16,7 +17,7 @@ use Quazardous\GramPHP\Tests\Contract\Store;
 
 final class MemoryHarness implements Harness
 {
-    public function journal(Dag $dag, callable $clock, string $subjectType = 'string', array $mergers = []): NodeJournal
+    public function journal(Graph|Dag $dag, callable $clock, string $subjectType = 'string', array $mergers = []): NodeJournal
     {
         return new NodeJournal(new MemoryDriver(), $dag, $clock, mergers: $mergers);
     }
@@ -45,7 +46,7 @@ final class MemoryHarness implements Harness
         return true === $journal->parentsConcluded($name, $subject);
     }
 
-    public function store(Dag $dag, callable $clock): ?Store
+    public function store(Graph|Dag $dag, callable $clock): ?Store
     {
         return null;            // one process, one storage
     }

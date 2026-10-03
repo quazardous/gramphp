@@ -68,6 +68,9 @@ final class NodeJournal
 
     public readonly Dag $dag;
 
+    /** The graph the journal was given, when it was given one: its policies. */
+    public readonly ?Graph $graph;
+
     /** @var (\Closure(): (string|\DateTimeInterface))|null */
     private readonly ?\Closure $clock;
 
@@ -77,19 +80,20 @@ final class NodeJournal
     private readonly array $mergers;
 
     /**
-     * @param Dag|list<Node>                                              $dag     checked when the journal is built
+     * @param Graph|Dag|list<Node>                                        $dag     checked when the journal is built
      * @param (callable(): (string|\DateTimeInterface))|null              $clock   defaults to the driver's: one time for every process
      * @param array<string, callable(list<string>, ?string): iterable<string>> $mergers the functions a lane names (`Merge::fn('<name>')`):
      *                                                                             given the refs waiting and the one arriving, the refs to keep
      */
     public function __construct(
         public readonly CoreDriver $driver,
-        Dag|array $dag,
+        Graph|Dag|array $dag,
         ?callable $clock = null,
         ?\Random\Randomizer $rng = null,
         array $mergers = [],
     ) {
-        $this->dag = $dag instanceof Dag ? $dag : new Dag(...$dag);
+        $this->graph = $dag instanceof Graph ? $dag : null;
+        $this->dag = $dag instanceof Graph ? $dag->dag : ($dag instanceof Dag ? $dag : new Dag(...$dag));
         $this->dag->check();
         $this->clock = null === $clock ? null : \Closure::fromCallable($clock);
         $this->rng = $rng ?? new \Random\Randomizer();
@@ -98,7 +102,7 @@ final class NodeJournal
             if (null !== $node->lane && !$driver instanceof LaneDriver) {
                 throw new MissingCapability('lane', \sprintf("node '%s', a lane", $node->name), LaneDriver::class);
             }
-            if ($node->limited() && !$driver instanceof LimitDriver) {
+            if ($this->limited($node) && !$driver instanceof LimitDriver) {
                 throw new MissingCapability('limit', \sprintf("node '%s', limited by a rate or a concurrency", $node->name), LimitDriver::class);
             }
         }
@@ -192,7 +196,7 @@ final class NodeJournal
                 return $this->driver->insertIfUnchanged($name, $part, Status::Running->value, $now, $token);
             };
 
-            return $node->limited() ? $this->withinLimits($node, $chosen, $now, $insert) : $insert(self::pairs($chosen));
+            return $this->limited($node) ? $this->withinLimits($node, $chosen, $now, $insert) : $insert(self::pairs($chosen));
         };
         // ONE WRITE PER CLAIM: under contention a claim may take fewer than
         // `limit`, never a wrong one. A GROUPING CLAIM READS AND WRITES UNDER
@@ -244,13 +248,17 @@ final class NodeJournal
         $now = $this->now();
         $touched = 0;
 
-        if (null !== $node->retry && Status::Failed->value === $status && null === $branch) {
+        // FIRST, THE RETRIES — each subject under its policy's: under the
+        // limit, the failure is archived and the node scheduled again.
+        $retryOf = $this->perPolicy($name, 'retry', $subjects);
+        if (Status::Failed->value === $status && null === $branch && [] !== array_filter($retryOf)) {
             $tries = $this->driver->archived($subjects, $name, Reason::Retry->value);
             $byDue = [];
             foreach ($subjects as $subject) {
+                $retry = $retryOf[Subject::key($subject)] ?? null;
                 $done = $tries[Subject::key($subject)] ?? 0;
-                if ($done < $node->retry->limit) {
-                    $wait = $node->retry->wait($done + 1, $this->rng);
+                if ($retry instanceof Retry && $done < $retry->limit) {
+                    $wait = $retry->wait($done + 1, $this->rng);
                     $byDue[Time::shift($now, $wait)][] = $subject;
                 }
             }
@@ -422,10 +430,24 @@ final class NodeJournal
         $now = $this->now();
         $released = [];
         foreach ($this->dag as $node) {
-            if (null === $node->lease) {
-                continue;
+            // A POLICY WITH ITS OWN LEASE is released on its own clock, and
+            // left out of the node's.
+            $special = [];
+            foreach ($this->variants($node->name) as $policy => $variant) {
+                if ($variant->lease !== $node->lease) {
+                    $special[$policy] = $variant->lease;
+                }
             }
-            $count = $this->driver->release($node->name, Time::shift($now, -Time::seconds($node->lease)), $now);
+            ksort($special, \SORT_STRING);
+            $count = 0;
+            if (null !== $node->lease) {
+                $count += $this->driver->release($node->name, Time::shift($now, -Time::seconds($node->lease)), $now, null, array_map('strval', array_keys($special)));
+            }
+            foreach ($special as $policy => $lease) {
+                if (null !== $lease) {
+                    $count += $this->driver->release($node->name, Time::shift($now, -Time::seconds($lease)), $now, [(string) $policy]);
+                }
+            }
             if ($count > 0) {
                 $released[$node->name] = $count;
             }
@@ -494,7 +516,6 @@ final class NodeJournal
         if (null === $node->lane) {
             throw new \InvalidArgumentException(\sprintf("node '%s' is not a lane: nothing arrives in it", $name));
         }
-        $lane = $node->lane;
         $out = ['queued' => 0, 'merged' => 0, 'skipped' => 0];
         $subjects = Subject::unique($subjects);
         if ([] === $subjects) {
@@ -502,43 +523,49 @@ final class NodeJournal
         }
         $driver = $this->lanes();
         $now = $this->now();
-        $group = $subjects;
-        if (WhileRunning::Skip === $lane->whileRunning) {
-            $pass = [$name, ...$this->dag->descendants($name)];
-            $progresses = $this->progressMany($subjects);
-            $group = $skipped = [];
-            foreach ($subjects as $subject) {
-                $busy = false;
-                foreach ($pass as $x) {
-                    $status = $progresses[Subject::key($subject)][$x] ?? null;
-                    $busy = $busy || Status::Running === $status || Status::Scheduled === $status;
-                }
-                if ($busy) {
+        // EACH SUBJECT IN THE LANE ITS POLICY TUNES.
+        $laneOf = $this->perPolicy($name, 'lane', $subjects);
+        $pass = [$name, ...$this->dag->descendants($name)];
+        $toSkip = array_values(array_filter($subjects, static fn(int|string $s): bool => ($laneOf[Subject::key($s)] ?? null) instanceof Lane && WhileRunning::Skip === $laneOf[Subject::key($s)]->whileRunning));
+        $progresses = [] === $toSkip ? [] : $this->progressMany($toSkip);
+        /** @var array<int, array{0: Lane, 1: list<int|string>}> $groups */
+        $groups = [];
+        $skipped = [];
+        foreach ($subjects as $subject) {
+            $key = Subject::key($subject);
+            $lane = $laneOf[$key] ?? null;
+            if (!$lane instanceof Lane) {
+                continue;
+            }
+            foreach ($pass as $x) {
+                $status = $progresses[$key][$x] ?? null;
+                if (Status::Running === $status || Status::Scheduled === $status) {
                     $skipped[] = $subject;
-                } else {
-                    $group[] = $subject;
+
+                    continue 2;
                 }
             }
-            if ([] !== $skipped) {
-                $this->driver->note($skipped, $name, Outcome::Skipped->value, Reason::Lane->value, $now, $ref);
-                $out['skipped'] = \count($skipped);
-            }
+            $groups[spl_object_id($lane)] ??= [$lane, []];
+            $groups[spl_object_id($lane)][1][] = $subject;
         }
-        if ([] === $group) {
-            return $out;
+        if ([] !== $skipped) {
+            $this->driver->note($skipped, $name, Outcome::Skipped->value, Reason::Lane->value, $now, $ref);
+            $out['skipped'] = \count($skipped);
         }
-        if ($lane->keepsEveryRef()) {
-            $this->keepEveryRef($driver, $name, $group, $lane, $ref, $now, $urgent, $out);
+        foreach ($groups as [$lane, $group]) {
+            if ($lane->keepsEveryRef()) {
+                $this->keepEveryRef($driver, $name, $group, $lane, $ref, $now, $urgent, $out);
 
-            return $out;
+                continue;
+            }
+            $outcome = $driver->arrive($name, $group, $ref, $now, $lane->merge, $lane->position->value, $urgent);
+            $merged = array_values(array_filter($group, static fn(int|string $s): bool => Outcome::Merged->value === ($outcome[Subject::key($s)] ?? null)));
+            if ([] !== $merged) {
+                $this->driver->note($merged, $name, Outcome::Merged->value, Reason::Lane->value, $now, $ref);
+            }
+            $out['merged'] += \count($merged);
+            $out['queued'] += \count(array_filter($group, static fn(int|string $s): bool => Outcome::Queued->value === ($outcome[Subject::key($s)] ?? null)));
         }
-        $outcome = $driver->arrive($name, $group, $ref, $now, $lane->merge, $lane->position->value, $urgent);
-        $merged = array_values(array_filter($group, static fn(int|string $s): bool => Outcome::Merged->value === ($outcome[Subject::key($s)] ?? null)));
-        if ([] !== $merged) {
-            $this->driver->note($merged, $name, Outcome::Merged->value, Reason::Lane->value, $now, $ref);
-        }
-        $out['merged'] += \count($merged);
-        $out['queued'] += \count(array_filter($group, static fn(int|string $s): bool => Outcome::Queued->value === ($outcome[Subject::key($s)] ?? null)));
 
         return $out;
     }
@@ -603,7 +630,11 @@ final class NodeJournal
 
                 continue;
             }
-            if (null === $node->wait && null === $node->grace) {
+            $graced = null !== $node->grace;
+            foreach ($this->variants($node->name) as $variant) {
+                $graced = $graced || null !== $variant->grace;
+            }
+            if (null === $node->wait && !$graced) {
                 continue;
             }
             $after = $this->dag->descendants($node->name);
@@ -633,6 +664,7 @@ final class NodeJournal
                     break;
                 }
                 $since = self::joinedSince($node, $entry);
+                $seenBy = $this->settings($node->name, $entry->policy);
                 if (null !== $node->wait) {
                     $at = $heard[$key] ?? null;
                     if (null !== $at && strcmp($at, $wentBack[$key] ?? '') >= 0) {
@@ -640,13 +672,13 @@ final class NodeJournal
                         ++$count;
                         continue;
                     }
-                    if (null !== $node->timeout && null !== $since
-                        && strcmp(Time::shift($since, Time::seconds($node->timeout)), $now) <= 0) {
+                    if (null !== $seenBy->timeout && null !== $since
+                        && strcmp(Time::shift($since, Time::seconds($seenBy->timeout)), $now) <= 0) {
                         $decided[Status::Failed->value][] = [$entry->subject, $entry->revision];
                         ++$count;
                     }
-                } elseif (null !== $since                       // no wait, so a grace: the node was kept for one
-                    && strcmp(Time::shift($since, Time::seconds($node->grace)), $now) <= 0) {
+                } elseif (null !== $since && null !== $seenBy->grace
+                    && strcmp(Time::shift($since, Time::seconds($seenBy->grace)), $now) <= 0) {
                     $decided[Status::Skipped->value][] = [$entry->subject, $entry->revision];
                     ++$count;
                 }
@@ -1033,16 +1065,17 @@ final class NodeJournal
                     continue 2;
                 }
             }
+            $tuned = $this->settings($node->name, $entry->policy)->lane ?? $lane;   // as the subject's policy tunes it
             if (!$arrival->urgent) {
                 $ready = [$arrival->place];
-                if (null !== $lane->delay) {
-                    $ready[] = Time::shift($arrival->place, Time::seconds($lane->delay));
+                if (null !== $tuned->delay) {
+                    $ready[] = Time::shift($arrival->place, Time::seconds($tuned->delay));
                 }
                 $ended = array_values(array_intersect_key($entry->finished, array_flip($pass)));
-                if (null !== $lane->cooldown && [] !== $ended) {
-                    $ready[] = Time::shift(max($ended), Time::seconds($lane->cooldown));
+                if (null !== $tuned->cooldown && [] !== $ended) {
+                    $ready[] = Time::shift(max($ended), Time::seconds($tuned->cooldown));
                 }
-                $late = null !== $lane->maxWait && strcmp(Time::shift($arrival->arrivedAt, Time::seconds($lane->maxWait)), $now) <= 0;
+                $late = null !== $tuned->maxWait && strcmp(Time::shift($arrival->arrivedAt, Time::seconds($tuned->maxWait)), $now) <= 0;
                 if (strcmp(max($ready), $now) > 0 && !$late) {
                     continue;
                 }
@@ -1063,7 +1096,7 @@ final class NodeJournal
         };
 
         // Due arrivals enter in the order of their places, within the lane's rate.
-        return \count($node->limited() ? $this->withinLimits($node, $chosen, $now, $enter) : $enter(self::pairs($chosen)));
+        return \count($this->limited($node) ? $this->withinLimits($node, $chosen, $now, $enter) : $enter(self::pairs($chosen)));
     }
 
     /** @param list<string> $refs */
@@ -1162,14 +1195,15 @@ final class NodeJournal
         $driver = $this->driver instanceof LimitDriver
             ? $this->driver
             : throw new MissingCapability('limit', \sprintf("node '%s'", $node->name), LimitDriver::class);
-        /** @var array<string, array{policy: ?string, entries: list<Entry>, bands: list<string>}> $budgets */
+        /** @var array<string, array{policy: ?string, seenBy: Node, entries: list<Entry>, bands: list<string>}> $budgets */
         $budgets = [];
         foreach ($chosen as $entry) {
             $policy = Per::Policy === $node->per ? $entry->policy : null;
             $id = null === $policy ? '*' : "p:{$policy}";
             if (!isset($budgets[$id])) {
                 $prefix = "{$node->name}|{$id}";
-                $budgets[$id] = ['policy' => $policy, 'entries' => [], 'bands' => array_map(static fn(int $i): string => "rate|{$prefix}|{$i}", array_keys($node->rate))];
+                $seenBy = Per::Policy === $node->per ? $this->settings($node->name, $policy) : $node;
+                $budgets[$id] = ['policy' => $policy, 'seenBy' => $seenBy, 'entries' => [], 'bands' => array_map(static fn(int $i): string => "rate|{$prefix}|{$i}", array_keys($seenBy->rate))];
             }
             $budgets[$id]['entries'][] = $entry;
         }
@@ -1186,19 +1220,20 @@ final class NodeJournal
             $taken = [];
             $advanced = [];
             foreach ($budgets as $budget) {
+                $seenBy = $budget['seenBy'];
                 $allowed = \count($budget['entries']);
-                if (null !== $node->concurrency) {
+                if (null !== $seenBy->concurrency) {
                     $busy = $driver->running($node->name, Per::Policy === $node->per ? [$budget['policy']] : null);
-                    $allowed = min($allowed, max(0, $node->concurrency - $busy));
+                    $allowed = min($allowed, max(0, $seenBy->concurrency - $busy));
                 }
                 $tats = array_map(static fn(string $k): ?float => $stored[$k] ?? null, $budget['bands']);
-                if ([] !== $node->rate) {
-                    [$allowed] = Rate::admit($node->rate, $tats, $instant, $allowed);
+                if ([] !== $seenBy->rate) {
+                    [$allowed] = Rate::admit($seenBy->rate, $tats, $instant, $allowed);
                 }
                 $written = $allowed > 0 ? $write(self::pairs(\array_slice($budget['entries'], 0, $allowed))) : [];
                 array_push($taken, ...$written);
-                if ([] !== $node->rate) {
-                    [, $moved] = Rate::admit($node->rate, $tats, $instant, \count($written));
+                if ([] !== $seenBy->rate) {
+                    [, $moved] = Rate::admit($seenBy->rate, $tats, $instant, \count($written));
                     foreach ($budget['bands'] as $i => $band) {
                         $advanced[$band] = $moved[$i];
                     }
@@ -1220,6 +1255,72 @@ final class NodeJournal
     private static function pairs(array $entries): array
     {
         return array_map(static fn(Entry $e): array => [$e->subject, $e->revision], $entries);
+    }
+
+    /** The node as a subject of `policy` sees it. */
+    public function settings(string $name, ?string $policy): Node
+    {
+        $this->dag->node($name);
+
+        return null === $this->graph ? $this->dag->node($name) : $this->graph->variant($policy)->node($name);
+    }
+
+    /**
+     * The node as each policy of the graph sees it.
+     *
+     * @return array<string, Node> policy => node
+     */
+    private function variants(string $name): array
+    {
+        $out = [];
+        foreach (array_keys($this->graph->policies ?? []) as $policy) {
+            $out[(string) $policy] = $this->settings($name, (string) $policy);
+        }
+
+        return $out;
+    }
+
+    /**
+     * `[Subject::key() => the value of setting on name for the subject's policy]`
+     * — one read of the policies, and only when a policy changes it.
+     *
+     * @param list<int|string> $subjects
+     *
+     * @return array<string, mixed>
+     */
+    private function perPolicy(string $name, string $setting, array $subjects): array
+    {
+        $node = $this->dag->node($name);
+        $out = [];
+        if (null === $this->graph || !$this->graph->overrides($name, $setting)) {
+            foreach ($subjects as $subject) {
+                $out[Subject::key($subject)] = $node->{$setting};
+            }
+
+            return $out;
+        }
+        $policies = $this->driver->policies($subjects);
+        foreach ($subjects as $subject) {
+            $key = Subject::key($subject);
+            $out[$key] = $this->settings($name, $policies[$key] ?? null)->{$setting};
+        }
+
+        return $out;
+    }
+
+    /** True when a claim on the node is cut by a rate or a concurrency, under some policy. */
+    private function limited(Node $node): bool
+    {
+        if ($node->limited()) {
+            return true;
+        }
+        foreach ($this->variants($node->name) as $variant) {
+            if ($variant->limited()) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /** @param string $why what needs the reading capability */

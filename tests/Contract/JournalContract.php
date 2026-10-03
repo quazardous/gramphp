@@ -8,7 +8,9 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Quazardous\GramPHP\Dag;
 use Quazardous\GramPHP\DagError;
+use Quazardous\GramPHP\Document;
 use Quazardous\GramPHP\Driver\LaneDriver;
+use Quazardous\GramPHP\Graph;
 use Quazardous\GramPHP\Group;
 use Quazardous\GramPHP\Lane;
 use Quazardous\GramPHP\Lease;
@@ -63,7 +65,7 @@ abstract class JournalContract extends TestCase
      * @param 'int'|'string'                                             $subjectType
      * @param array<string, callable(list<string>, ?string): iterable<string>> $mergers
      */
-    private function journal(?Dag $dag = null, string $subjectType = 'string', array $mergers = []): NodeJournal
+    private function journal(Graph|Dag|null $dag = null, string $subjectType = 'string', array $mergers = []): NodeJournal
     {
         return $this->harness->journal($dag ?? Graphs::diamond(), $this->clock, $subjectType, $mergers);
     }
@@ -1108,6 +1110,114 @@ abstract class JournalContract extends TestCase
         self::assertTaken([7, $big], $this->claim($journal, 'scrape', [$big, 7]));
     }
 
+    // -- policies --------------------------------------------------------
+
+    /** Onboarding and a flaky call in one graph, where `slow` waits longer, retries more and holds longer. */
+    private static function policied(): Graph
+    {
+        return new Graph(new Document('policies'), new Dag(
+            new Node('send'),
+            new Node('clicked', parents: ['send'], wait: 'email.clicked', timeout: '7d'),
+            new Node('call', parents: ['send'], retry: new Retry(limit: 1, delay: '10s'), lease: '1h'),
+            new Node('survey', parents: ['send'], optional: true, grace: '1d'),
+        ), [
+            'slow' => [
+                'clicked' => ['timeout' => '30d'],
+                'call' => ['retry' => new Retry(limit: 3, delay: '1m'), 'lease' => '5h'],
+                'survey' => ['grace' => '10d'],
+            ],
+        ]);
+    }
+
+    public function testASubjectCarriesItsPolicy(): void
+    {
+        $journal = $this->journal(self::policied());
+        self::assertSame(2, $journal->enroll(['a', 'b'], 'slow'));
+        self::assertSame('slow', $journal->policy('a'));
+        self::assertNull($journal->policy('c'));
+        $journal->enroll(['b'], null);
+        self::assertNull($journal->policy('b'));
+        self::assertSame('5h', $journal->settings('call', 'slow')->lease);
+        self::assertSame('1h', $journal->settings('call', null)->lease);
+        self::assertSame('1h', $journal->settings('call', 'unknown')->lease, 'an unknown policy sees the defaults');
+    }
+
+    public function testAPolicyChangesRetriesLeasesTimeoutsAndGraces(): void
+    {
+        $journal = $this->journal(self::policied());
+        $journal->enroll(['slow'], 'slow');
+        $this->work($journal, 'send', ['slow', 'fast']);
+
+        // retries: one for the default, three for `slow`
+        for ($i = 0; $i < 2; ++$i) {
+            $lease = $this->claim($journal, 'call', ['slow', 'fast']);
+            $journal->fail('call', $lease, $lease->token);
+            $this->clock->now = Time::shift($this->clock->now, 3600);
+        }
+        self::assertSame(Status::Failed, $journal->progress('fast')['call']);
+        self::assertSame(Status::Scheduled, $journal->progress('slow')['call']);
+
+        // leases: 1h by default, 5h for `slow`
+        self::assertTaken(['slow'], $this->claim($journal, 'call', ['slow']));
+        $this->clock->now = Time::shift($this->clock->now, 2 * 3600);
+        self::assertSame([], $journal->expire(), 'two hours is within the `slow` lease');
+        $this->clock->now = Time::shift($this->clock->now, 4 * 3600);
+        self::assertSame(['call' => 1], $journal->expire());
+
+        // timeouts and graces, measured from `send` concluding
+        $this->clock->now = '2026-01-08T00:00:00+00:00';
+        $settled = $journal->settle($this->harness->candidates(['slow', 'fast']));
+        self::assertSame(['failed' => 1], $settled['clicked']);
+        self::assertSame(['skipped' => 1], $settled['survey']);
+        self::assertArrayNotHasKey('clicked', $journal->progress('slow'));
+        self::assertArrayNotHasKey('survey', $journal->progress('slow'));
+    }
+
+    public function testASourceThatNeedsAnExtraStepSkipsItElsewhere(): void
+    {
+        // The node is optional for everyone, and the policy that does not want
+        // it gives it a grace: `settle` skips it, and `skipped` satisfies what follows.
+        $journal = $this->journal(new Graph(new Document('offers'), new Dag(
+            new Node('scrape'),
+            new Node('enrich', parents: ['scrape'], optional: true),
+            new Node('publish', parents: ['enrich']),
+        ), ['plain' => ['enrich' => ['grace' => '1s']]]));
+        $journal->enroll(['plain1'], 'plain');
+        $this->work($journal, 'scrape', ['rich1', 'plain1']);
+        $this->clock->now = '2026-01-01T00:00:05+00:00';
+        self::assertSame(['enrich' => ['skipped' => 1]], $journal->settle($this->harness->candidates(['rich1', 'plain1'])), 'only the policy with a grace');
+        self::assertSame(Status::Skipped, $journal->progress('plain1')['enrich']);
+        self::assertArrayNotHasKey('enrich', $journal->progress('rich1'), 'no grace: never skipped alone');
+        self::assertTaken(['plain1'], $this->claim($journal, 'publish', ['plain1', 'rich1']));
+        $this->work($journal, 'enrich', ['rich1']);
+        self::assertTaken(['rich1'], $this->claim($journal, 'publish', ['rich1']));
+    }
+
+    public function testAPolicyTunesItsLane(): void
+    {
+        $journal = $this->journal(new Graph(new Document('listings'), Graphs::listing(), ['fast' => ['arrive' => ['lane' => Lane::throttle(cooldown: '5m')]]]));
+        $journal->enroll(['slow1'], null);
+        $journal->enroll(['fast1'], 'fast');
+        $journal->arrive('arrive', ['slow1', 'fast1']);
+        self::assertSame(2, $this->letIn($journal, ['slow1', 'fast1']));
+        $this->through($journal, ['slow1', 'fast1']);
+        $journal->arrive('arrive', ['slow1', 'fast1']);
+        $this->clock->now = self::at(5);
+        self::assertSame(1, $this->letIn($journal, ['slow1', 'fast1']));
+        self::assertNotNull($journal->arrival('slow1', 'arrive'), 'the default lane still cools down');
+    }
+
+    public function testAPolicyKeepsItsOwnRate(): void
+    {
+        $journal = $this->journal(new Graph(
+            new Document('api'),
+            new Dag(new Node('call', rate: [new Rate(1, '1h')], per: Per::Policy)),
+            ['bulk' => ['call' => ['rate' => [new Rate(3, '1h')]]]],
+        ));
+        $journal->enroll(['b1', 'b2', 'b3', 'b4'], 'bulk');
+        self::assertTaken(['b1', 'b2', 'b3', 'x'], $this->claim($journal, 'call', ['b1', 'b2', 'b3', 'b4', 'x', 'y']), 'three an hour for bulk, one for the rest');
+    }
+
     // -- rate and concurrency --------------------------------------------
 
     public function testConcurrencyCapsWhatRunsAtOnce(): void
@@ -1139,6 +1249,18 @@ abstract class JournalContract extends TestCase
         $journal->enroll(['s1', 's2'], 'small');
         self::assertTaken(['b1', 's1', 'x'], $this->claim($journal, 'call', ['b1', 'b2', 'b3', 's1', 's2', 'x', 'y']), 'one for big, one for small, one for the subjects without a policy');
         self::assertTaken([], $this->claim($journal, 'call', ['b2', 's2', 'y']), 'every budget is spent');
+    }
+
+    public function testAPolicyGivesItsBudgetItsOwnSize(): void
+    {
+        $journal = $this->journal(new Graph(
+            new Document('api'),
+            new Dag(new Node('call', concurrency: 1, per: Per::Policy)),
+            ['big' => ['call' => ['concurrency' => 3]]],
+        ));
+        $journal->enroll(['b1', 'b2', 'b3', 'b4'], 'big');
+        $journal->enroll(['s1', 's2'], 'small');
+        self::assertTaken(['b1', 'b2', 'b3', 's1', 'x'], $this->claim($journal, 'call', ['b1', 'b2', 'b3', 'b4', 's1', 's2', 'x']), '3 for big, 1 for small, 1 for the subjects without a policy');
     }
 
     public function testALaneLetsArrivalsInByPlaceWithinItsRate(): void
@@ -1602,7 +1724,7 @@ abstract class JournalContract extends TestCase
         };
     }
 
-    private function store(Dag $dag): Store
+    private function store(Graph|Dag $dag): Store
     {
         $store = $this->harness->store($dag, $this->clock);
         if (null === $store) {

@@ -24,6 +24,12 @@ follows [Semantic Versioning](https://semver.org/).
 - The MariaDB driver runs over PDO or over a Doctrine DBAL connection
   (`DbalSql`), so a Symfony application can share its own connection and
   transaction; the contract runs on both.
+- Policies: `Graph` (a `Document`, the nodes, and per-policy settings,
+  checked under every policy) and `Graph::variant()`. A policy changes a
+  node's `retry`, `lease`, `timeout`, `grace`, `rate`, `concurrency` or
+  `lane`; the journal reads each subject's through its policy
+  (`NodeJournal::settings()`), `expire` releasing a policy's lease on its own
+  clock.
 - Rate limits (`Rate` bands, a generic cell rate algorithm), concurrency
   caps and `Per::Policy` budgets (`LimitDriver`), decided by the journal under
   the driver's guard; groups (`Group`): a claim hands out a whole group of

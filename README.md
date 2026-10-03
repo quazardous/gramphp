@@ -100,6 +100,29 @@ A transaction mixing several claims and forgets on the same subjects can
 meet a deadlock: InnoDB reports it (error 1213, SQLSTATE 40001), rolls the
 transaction back, and the caller retries it — nothing is ever half-written.
 
+## Policies: one workflow, several ways of pushing it
+
+Subjects differ in how hard they may be pushed — a slow partner, a bulk
+customer. A **policy** changes a node's settings, never its structure:
+
+```php
+use Quazardous\GramPHP\Document;
+use Quazardous\GramPHP\Graph;
+
+$graph = new Graph(new Document('offers', version: '1'), $dag, policies: [
+    'slow-partner' => ['call' => ['retry' => new Retry(5, '1m'), 'lease' => '2h']],
+    'bulk' => ['call' => ['rate' => [new Rate(1000, '1h')]]],   // needs per: Per::Policy
+]);
+$journal = new NodeJournal($driver, $graph);
+$journal->enroll($subjects, 'slow-partner');
+```
+
+A policy may change `retry`, `lease`, `timeout`, `grace`, `rate`,
+`concurrency` and `lane` (tune it, never add or remove one); the graph is
+checked under every policy. Each subject is read through its own: its
+retries, its lease (`expire`), its timeout and grace (`settle`), its budget
+and its lane.
+
 ## Limits and groups
 
 What a node uses is protected where the claim is decided:
@@ -211,14 +234,13 @@ could take now) and `oldest_ready` (starvation).
 Ported so far: the graph and its claim rule, joins (`on`, `need`), choices,
 loops, retries, leases, waits and signals, grace, skip, adopt, forget,
 release, the history, counts, stages and snapshots, rate limits,
-concurrency caps and groups, lanes (throttle, debounce, dedupe, batch, merge
+concurrency caps and groups, policies, lanes (throttle, debounce, dedupe, batch, merge
 functions) and the items layer — with the
 memory and MariaDB drivers, both certified by the shared contract,
 concurrency included.
 
-Still to port from grampy: policies (a policy tuning a node's retry, lease,
-grace, rate, concurrency or lane), graph versions and migration, and the
-diagram.
+Still to port from grampy: graph versions and migration, and the diagram
+(with the graph's JSON form).
 
 ## Development
 

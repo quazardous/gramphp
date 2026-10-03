@@ -7,6 +7,7 @@ namespace Quazardous\GramPHP\Tests\Driver;
 use Quazardous\GramPHP\Dag;
 use Quazardous\GramPHP\Driver\Mariadb\MariadbDriver;
 use Quazardous\GramPHP\Driver\Mariadb\Query;
+use Quazardous\GramPHP\Graph;
 use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Status;
 use Quazardous\GramPHP\Tests\Contract\Clock;
@@ -74,7 +75,7 @@ final class MariadbHarness implements Harness
         return new MariadbDriver($db->sql(), $subjectType, $tables['table'], $tables['revisions'], $tables['history'], $tables['limits'], arrivals: $tables['arrivals']);
     }
 
-    public function journal(Dag $dag, callable $clock, string $subjectType = 'string', array $mergers = []): NodeJournal
+    public function journal(Graph|Dag $dag, callable $clock, string $subjectType = 'string', array $mergers = []): NodeJournal
     {
         $tables = $this->createTables($subjectType);
         $db = $this->connect();
@@ -150,7 +151,7 @@ final class MariadbHarness implements Harness
         return true === $journal->parentsConcluded($name, $subject);
     }
 
-    public function store(Dag $dag, callable $clock): Store
+    public function store(Graph|Dag $dag, callable $clock): Store
     {
         $harness = $this;
         $tables = $this->createTables('string');
@@ -163,7 +164,7 @@ final class MariadbHarness implements Harness
             public function __construct(
                 private readonly MariadbHarness $harness,
                 private readonly array $tables,
-                private readonly Dag $dag,
+                private readonly Graph|Dag $dag,
                 private $clock,
             ) {}
 
