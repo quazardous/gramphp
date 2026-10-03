@@ -11,6 +11,7 @@ use Quazardous\GramPHP\Driver\LimitDriver;
 use Quazardous\GramPHP\Driver\NodeTimes;
 use Quazardous\GramPHP\Driver\ProgressMany;
 use Quazardous\GramPHP\Driver\ReadingDriver;
+use Quazardous\GramPHP\Driver\VersionDriver;
 use Quazardous\GramPHP\Entry;
 use Quazardous\GramPHP\Keyed;
 use Quazardous\GramPHP\Merge;
@@ -74,7 +75,7 @@ use Quazardous\GramPHP\Time;
  * (a BIGINT column) or `'string'` (VARCHAR), and every subject read from the
  * tables is returned in that type.
  */
-final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, ProgressMany, LaneDriver, LimitDriver
+final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, ProgressMany, LaneDriver, LimitDriver, VersionDriver
 {
     /** Values bound per statement, at most. */
     private const CHUNK = 500;
@@ -514,6 +515,83 @@ final class MariadbDriver implements CoreDriver, ReadingDriver, NodeTimes, Progr
         }
 
         return $block();
+    }
+
+    // -- versions --------------------------------------------------------
+
+    /** Never overwrites: `COALESCE` keeps a version already there. */
+    public function pin(array $subjects, string $version): int
+    {
+        $this->requireTransaction();
+        usort($subjects, static fn(int|string $a, int|string $b): int => strcmp((string) $a, (string) $b));
+        $count = 0;
+        foreach ($subjects as $subject) {
+            $written = $this->sql->execute(
+                "INSERT INTO {$this->revisions} ({$this->subject}, revision, version) VALUES (?, 0, ?) "
+                . 'ON DUPLICATE KEY UPDATE version = COALESCE(version, VALUES(version))',
+                [$subject, $version],
+            );
+            $count += $written > 0 ? 1 : 0;
+        }
+
+        return $count;
+    }
+
+    public function versions(array $subjects): array
+    {
+        $out = [];
+        foreach (array_chunk($subjects, self::CHUNK) as $chunk) {
+            $rows = $this->sql->select(
+                "SELECT {$this->subject}, version FROM {$this->revisions} WHERE version IS NOT NULL AND {$this->subject} IN (" . self::marks($chunk) . ')',
+                $chunk,
+            );
+            foreach ($rows as [$subject, $version]) {
+                $out[Subject::key($this->cast($subject))] = self::text($version);
+            }
+        }
+
+        return $out;
+    }
+
+    /** Revision first — its exclusive lock held to the commit — then the rows, read out before any is written back. */
+    public function rewrite(int|string $subject, array $rename, array $drop, string $version, string $now): void
+    {
+        $this->requireTransaction();
+        $this->raiseRevision($subject);
+        $this->sql->execute("UPDATE {$this->revisions} SET version = ? WHERE {$this->subject} = ?", [$version, $subject]);
+        foreach ($drop as $name) {
+            $this->takeAway("node = ? AND {$this->subject} = ?", [$name, $subject], $now, Reason::Migrate->value);
+            $this->sql->execute("DELETE FROM {$this->arrivals} WHERE {$this->subject} = ? AND node = ?", [$subject, $name]);
+        }
+        if ([] === $rename) {
+            return;
+        }
+        $old = array_map('strval', array_keys($rename));
+        $marks = self::marks($old);
+        // All the old names out first, then in under the new ones: a swap
+        // (a => b, b => a) moves every row once.
+        $rows = $this->sql->select(
+            "SELECT node, status, started_at, finished_at, lease FROM {$this->table} WHERE {$this->subject} = ? AND node IN ({$marks}) FOR UPDATE",
+            [$subject, ...$old],
+        );
+        $waiting = $this->sql->select(
+            "SELECT node, ref, place, arrived_at, urgent, refs FROM {$this->arrivals} WHERE {$this->subject} = ? AND node IN ({$marks}) FOR UPDATE",
+            [$subject, ...$old],
+        );
+        $this->sql->execute("DELETE FROM {$this->table} WHERE {$this->subject} = ? AND node IN ({$marks})", [$subject, ...$old]);
+        $this->sql->execute("DELETE FROM {$this->arrivals} WHERE {$this->subject} = ? AND node IN ({$marks})", [$subject, ...$old]);
+        foreach ($rows as [$node, $status, $started, $ended, $lease]) {
+            $this->sql->execute(
+                "INSERT INTO {$this->table} ({$this->subject}, " . self::COLUMNS . ') VALUES (?, ?, ?, ?, ?, ?)',
+                [$subject, $rename[self::text($node)], $status, $started, $ended, $lease],
+            );
+        }
+        foreach ($waiting as [$node, $ref, $place, $arrived, $urgent, $refs]) {
+            $this->sql->execute(
+                "INSERT INTO {$this->arrivals} ({$this->subject}, node, ref, place, arrived_at, urgent, refs) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [$subject, $rename[self::text($node)], $ref, $place, $arrived, $urgent, $refs],
+            );
+        }
     }
 
     // -- limits ----------------------------------------------------------

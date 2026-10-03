@@ -11,6 +11,7 @@ use Quazardous\GramPHP\Driver\MissingCapability;
 use Quazardous\GramPHP\Driver\NodeTimes;
 use Quazardous\GramPHP\Driver\ProgressMany;
 use Quazardous\GramPHP\Driver\ReadingDriver;
+use Quazardous\GramPHP\Driver\VersionDriver;
 
 /**
  * THE NODE JOURNAL — who started what, and where it stands.
@@ -20,6 +21,7 @@ use Quazardous\GramPHP\Driver\ReadingDriver;
  *     skip      give up an optional node
  *     adopt     record work already done that the journal does not know
  *     forget    erase it — "never started", the initial state
+ *     migrate   move subjects pinned to another version of the graph onto this one
  *     release   give back the leases of a dead worker
  *     expire    give back every lease held longer than its node allows
  *     signal    record that an awaited event happened, for subjects
@@ -71,6 +73,15 @@ final class NodeJournal
     /** The graph the journal was given, when it was given one: its policies. */
     public readonly ?Graph $graph;
 
+    /**
+     * SUBJECTS ARE PINNED TO THE GRAPH THEY STARTED ON: a journal on a `Graph`
+     * takes only subjects pinned to it, or not yet pinned, and pins them on
+     * their first write — once, never again. It is the whole
+     * `Document::identity()`, so two workflows sharing a version string stay
+     * strangers. Null for a bare `Dag`.
+     */
+    public readonly ?string $version;
+
     /** @var (\Closure(): (string|\DateTimeInterface))|null */
     private readonly ?\Closure $clock;
 
@@ -93,6 +104,10 @@ final class NodeJournal
         array $mergers = [],
     ) {
         $this->graph = $dag instanceof Graph ? $dag : null;
+        $this->version = $this->graph?->document->identity();
+        if (null !== $this->graph && !$driver instanceof VersionDriver) {
+            throw new MissingCapability('version', 'a journal built on a Graph, whose subjects are pinned to it', VersionDriver::class);
+        }
         $this->dag = $dag instanceof Graph ? $dag->dag : ($dag instanceof Dag ? $dag : new Dag(...$dag));
         $this->dag->check();
         $this->clock = null === $clock ? null : \Closure::fromCallable($clock);
@@ -169,7 +184,7 @@ final class NodeJournal
                         continue;                 // a subject listed twice counts once
                     }
                     $seen[$key] = true;
-                    if (!$this->takable($node, $after, self::dueAway($name, $entry, $now), $requireParents)) {
+                    if (!$this->mine($entry) || !$this->takable($node, $after, self::dueAway($name, $entry, $now), $requireParents)) {
                         continue;
                     }
                     if (null !== $node->group) {
@@ -205,6 +220,7 @@ final class NodeJournal
         $taken = null === $node->group
             ? $write($gather())
             : $this->driver->guard(["group|{$name}"], static fn(): array => $write($gather()));
+        $this->pin($taken);
 
         return new Lease($taken, $token);
     }
@@ -358,7 +374,7 @@ final class NodeJournal
         foreach ($this->driver->scan($candidates, $name, [$name, ...$node->parents], $parents, self::PAGE, $now) as $page) {
             foreach ($page as $entry) {
                 $key = Subject::key($entry->subject);
-                if (isset($seen[$key]) || \array_key_exists($name, $entry->rows) || !$this->dag->joined($name, $entry->rows)) {
+                if (isset($seen[$key]) || !$this->mine($entry) || \array_key_exists($name, $entry->rows) || !$this->dag->joined($name, $entry->rows)) {
                     continue;
                 }
                 $seen[$key] = true;
@@ -372,7 +388,10 @@ final class NodeJournal
             return 0;
         }
 
-        return \count($this->driver->insertIfUnchanged($name, $chosen, Status::Skipped->value, $now, null));
+        $written = $this->driver->insertIfUnchanged($name, $chosen, Status::Skipped->value, $now, null);
+        $this->pin($written);
+
+        return \count($written);
     }
 
     /**
@@ -387,7 +406,13 @@ final class NodeJournal
         $this->dag->node($name);
         $subjects = Subject::unique($subjects);
 
-        return [] === $subjects ? 0 : $this->driver->adopt($name, $subjects, $this->now());
+        if ([] === $subjects) {
+            return 0;
+        }
+        $count = $this->driver->adopt($name, $subjects, $this->now());
+        $this->pin($subjects);
+
+        return $count;
     }
 
     // -- undo ------------------------------------------------------------
@@ -414,7 +439,7 @@ final class NodeJournal
     {
         $this->dag->node($name);
 
-        return $this->driver->release($name, Time::stamp($olderThan), $this->now());
+        return $this->driver->release($name, Time::stamp($olderThan), $this->now(), null, [], $this->version);
     }
 
     /**
@@ -441,11 +466,11 @@ final class NodeJournal
             ksort($special, \SORT_STRING);
             $count = 0;
             if (null !== $node->lease) {
-                $count += $this->driver->release($node->name, Time::shift($now, -Time::seconds($node->lease)), $now, null, array_map('strval', array_keys($special)));
+                $count += $this->driver->release($node->name, Time::shift($now, -Time::seconds($node->lease)), $now, null, array_map('strval', array_keys($special)), $this->version);
             }
             foreach ($special as $policy => $lease) {
                 if (null !== $lease) {
-                    $count += $this->driver->release($node->name, Time::shift($now, -Time::seconds($lease)), $now, [(string) $policy]);
+                    $count += $this->driver->release($node->name, Time::shift($now, -Time::seconds($lease)), $now, [(string) $policy], [], $this->version);
                 }
             }
             if ($count > 0) {
@@ -466,7 +491,13 @@ final class NodeJournal
     {
         $subjects = Subject::unique($subjects);
 
-        return [] === $subjects ? 0 : $this->driver->enroll($subjects, $policy);
+        if ([] === $subjects) {
+            return 0;
+        }
+        $count = $this->driver->enroll($subjects, $policy);
+        $this->pin($subjects);
+
+        return $count;
     }
 
     /** The subject's policy, null when it has none. */
@@ -566,6 +597,7 @@ final class NodeJournal
             $out['merged'] += \count($merged);
             $out['queued'] += \count(array_filter($group, static fn(int|string $s): bool => Outcome::Queued->value === ($outcome[Subject::key($s)] ?? null)));
         }
+        $this->pin($subjects);
 
         return $out;
     }
@@ -642,7 +674,7 @@ final class NodeJournal
             $ready = [];
             foreach ($this->driver->scan($candidates, $node->name, [$node->name, ...$node->parents, ...$after], $parents, self::PAGE, $now, $after) as $page) {
                 foreach ($page as $entry) {
-                    if ($this->dag->claimable($node->name, self::dueAway($node->name, $entry, $now))) {
+                    if ($this->mine($entry) && $this->dag->claimable($node->name, self::dueAway($node->name, $entry, $now))) {
                         $ready[Subject::key($entry->subject)] ??= $entry;
                     }
                 }
@@ -685,6 +717,7 @@ final class NodeJournal
             }
             foreach ($decided as $status => $chosen) {
                 $written = $this->driver->insertIfUnchanged($node->name, $chosen, (string) $status, $now, null);
+                $this->pin($written);
                 if ([] !== $written) {
                     $out[$node->name][(string) $status] = \count($written);
                 }
@@ -703,6 +736,12 @@ final class NodeJournal
      */
     public function progress(int|string $subject): array
     {
+        // A JOURNAL ONLY SPEAKS ABOUT ITS OWN SUBJECTS: one pinned to another
+        // graph reads empty, as it claims empty.
+        if (null !== $this->version && $this->version !== ($this->versions([$subject])[Subject::key($subject)] ?? $this->version)) {
+            return [];
+        }
+
         return array_map(Status::from(...), $this->driver->progress($subject));
     }
 
@@ -728,10 +767,12 @@ final class NodeJournal
                 $read[Subject::key($subject)] = $this->driver->progress($subject);
             }
         }
+        $pinned = null === $this->version ? [] : $this->versions($subjects);
         $out = [];
         foreach ($subjects as $subject) {
             $key = Subject::key($subject);
-            $out[$key] = array_map(Status::from(...), $read[$key] ?? []);
+            $elsewhere = isset($pinned[$key]) && $pinned[$key] !== $this->version;
+            $out[$key] = $elsewhere ? [] : array_map(Status::from(...), $read[$key] ?? []);
         }
 
         return $out;
@@ -901,7 +942,7 @@ final class NodeJournal
                     continue;
                 }
                 $seen[$key] = true;
-                if (!$this->takable($node, $after, self::dueAway($node->name, $entry, $now), true)) {
+                if (!$this->mine($entry) || !$this->takable($node, $after, self::dueAway($node->name, $entry, $now), true)) {
                     continue;
                 }
                 ++$ready;
@@ -1043,7 +1084,7 @@ final class NodeJournal
         foreach ($this->driver->scan($candidates, null, [...$pass, ...$node->parents], [], self::PAGE, $now) as $page) {
             foreach ($page as $entry) {
                 $key = Subject::key($entry->subject);
-                if (!isset($entries[$key])) {
+                if (!isset($entries[$key]) && $this->mine($entry)) {
                     $order[$key] = \count($order);
                     $entries[$key] = $entry;
                 }
@@ -1257,6 +1298,150 @@ final class NodeJournal
         return array_map(static fn(Entry $e): array => [$e->subject, $e->revision], $entries);
     }
 
+    // -- versions --------------------------------------------------------
+
+    /**
+     * The graph the subject is pinned to — a `Document::identity()` — or null
+     * before its first write. IT IS WRITTEN ONCE: only `migrate` changes it.
+     */
+    public function pinned(int|string $subject): ?string
+    {
+        return $this->versions([$subject])[Subject::key($subject)] ?? null;
+    }
+
+    /**
+     * MOVE SUBJECTS FROM `source` — another version of this graph — ONTO THIS
+     * ONE, or refuse them all.
+     *
+     * `mapping` names what became of each source node: another name, or null
+     * when it is gone (its rows are archived, reason `migrate`). A node left
+     * out keeps its name, and must exist here.
+     *
+     * A subject is COMPLIANT when its journal could have been written on this
+     * graph: every row, once renamed, stands where the rule of this graph lets
+     * a row stand — its parents joined. A dropped node held by a worker makes
+     * a subject non-compliant too.
+     *
+     * ALL OR NOTHING: every subject is checked before anything is written;
+     * one failure raises `MigrationError` naming each non-compliant subject
+     * and why, and nothing moves. Return the count migrated.
+     *
+     * @param iterable<int|string>       $subjects
+     * @param array<string, string|null> $mapping
+     */
+    public function migrate(iterable $subjects, Graph $source, array $mapping = []): int
+    {
+        if (null === $this->version || !$this->driver instanceof VersionDriver) {
+            throw new \LogicException('migrate needs a journal built on a Graph');
+        }
+        $from = $source->document->identity();
+        if ($from === $this->version) {
+            throw new \InvalidArgumentException(\sprintf("the source is already '%s'", $this->version));
+        }
+        $there = array_map(static fn(Node $n): string => $n->name, $source->dag->nodes());
+        $unknown = array_values(array_diff(array_map('strval', array_keys($mapping)), $there));
+        if ([] !== $unknown) {
+            sort($unknown);
+            throw new \InvalidArgumentException(\sprintf('mapping names nodes the source does not have: [%s]', implode(', ', $unknown)));
+        }
+        $full = [];
+        foreach ($there as $name) {
+            $full[$name] = \array_key_exists($name, $mapping) ? $mapping[$name] : $name;
+        }
+        $missing = [];
+        foreach ($full as $name => $target) {
+            if (null !== $target && !$this->dag->has($target)) {
+                $missing[] = $name;
+            }
+        }
+        if ([] !== $missing) {
+            sort($missing);
+            throw new \InvalidArgumentException(\sprintf(
+                "source nodes with nowhere to go on '%s': [%s] — map them to a node or to null",
+                $this->version,
+                implode(', ', $missing),
+            ));
+        }
+        $landed = array_values(array_filter($full, static fn(?string $t): bool => null !== $t));
+        if (\count($landed) !== \count(array_unique($landed))) {
+            throw new \InvalidArgumentException('two source nodes are mapped onto the same node');
+        }
+
+        $subjects = Subject::unique($subjects);
+        $pinned = $this->driver->versions($subjects);
+        $ours = array_values(array_filter($subjects, static fn(int|string $s): bool => ($pinned[Subject::key($s)] ?? $from) === $from));
+        $progresses = [];
+        foreach ($ours as $subject) {
+            $progresses[Subject::key($subject)] = $this->driver->progress($subject);
+        }
+        $problems = [];
+        $plans = [];
+        foreach ($subjects as $subject) {
+            $key = Subject::key($subject);
+            if (($pinned[$key] ?? $from) !== $from) {
+                $problems[$key] = \sprintf("pinned to '%s'", $pinned[$key] ?? '');
+
+                continue;
+            }
+            $progress = $progresses[$key] ?? [];
+            $held = [];
+            $moved = [];
+            foreach ($progress as $name => $status) {
+                $target = \array_key_exists($name, $full) ? $full[$name] : $name;
+                if (null === $target) {
+                    if (\in_array($status, [Status::Running->value, Status::Scheduled->value], true)) {
+                        $held[] = $name;
+                    }
+
+                    continue;
+                }
+                $moved[$target] = $status;
+            }
+            if ([] !== $held) {
+                sort($held);
+                $problems[$key] = \sprintf('[%s] would be dropped while held or scheduled', implode(', ', $held));
+
+                continue;
+            }
+            $stray = array_values(array_filter(array_map('strval', array_keys($moved)), fn(string $n): bool => !$this->dag->has($n)));
+            if ([] !== $stray) {
+                sort($stray);
+                $problems[$key] = \sprintf("rows on [%s], which '%s' lacks", implode(', ', $stray), $this->version);
+
+                continue;
+            }
+            $unjoined = array_values(array_filter(array_map('strval', array_keys($moved)), fn(string $n): bool => !$this->dag->joined($n, $moved)));
+            if ([] !== $unjoined) {
+                sort($unjoined);
+                $problems[$key] = \sprintf("[%s] could not have run on '%s': their parents are not joined", implode(', ', $unjoined), $this->version);
+
+                continue;
+            }
+            $plans[] = $subject;
+        }
+        if ([] !== $problems) {
+            throw new MigrationError($problems);
+        }
+        // Every renamed or dropped node is passed, rows or not: an arrival
+        // waiting in a lane follows its node too.
+        $rename = [];
+        $drop = [];
+        foreach ($full as $name => $target) {
+            if (null === $target) {
+                $drop[] = (string) $name;
+            } elseif ($target !== $name) {
+                $rename[(string) $name] = $target;
+            }
+        }
+        sort($drop);
+        $now = $this->now();
+        foreach ($plans as $subject) {
+            $this->driver->rewrite($subject, $rename, $drop, $this->version, $now);
+        }
+
+        return \count($plans);
+    }
+
     /** The node as a subject of `policy` sees it. */
     public function settings(string $name, ?string $policy): Node
     {
@@ -1306,6 +1491,30 @@ final class NodeJournal
         }
 
         return $out;
+    }
+
+    /** True when this journal may work on the subject: pinned to its graph, or not yet pinned. */
+    private function mine(Entry $entry): bool
+    {
+        return null === $this->version || null === $entry->version || $entry->version === $this->version;
+    }
+
+    /** @param list<int|string> $subjects pinned to this graph, if they are pinned to none */
+    private function pin(array $subjects): void
+    {
+        if (null !== $this->version && [] !== $subjects && $this->driver instanceof VersionDriver) {
+            $this->driver->pin($subjects, $this->version);
+        }
+    }
+
+    /**
+     * @param list<int|string> $subjects
+     *
+     * @return array<string, string>
+     */
+    private function versions(array $subjects): array
+    {
+        return $this->driver instanceof VersionDriver ? $this->driver->versions($subjects) : [];
     }
 
     /** True when a claim on the node is cut by a rate or a concurrency, under some policy. */

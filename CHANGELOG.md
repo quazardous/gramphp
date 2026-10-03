@@ -24,6 +24,11 @@ follows [Semantic Versioning](https://semver.org/).
 - The MariaDB driver runs over PDO or over a Doctrine DBAL connection
   (`DbalSql`), so a Symfony application can share its own connection and
   transaction; the contract runs on both.
+- Versions (`VersionDriver`): a journal on a `Graph` pins each subject to
+  its `Document::identity()` on its first write and never touches a subject
+  pinned elsewhere; `pinned()`; `migrate()` moves subjects to another version,
+  renaming and dropping nodes (arrivals included), all or nothing
+  (`MigrationError`).
 - Policies: `Graph` (a `Document`, the nodes, and per-policy settings,
   checked under every policy) and `Graph::variant()`. A policy changes a
   node's `retry`, `lease`, `timeout`, `grace`, `rate`, `concurrency` or

@@ -15,6 +15,7 @@ use Quazardous\GramPHP\Group;
 use Quazardous\GramPHP\Lane;
 use Quazardous\GramPHP\Lease;
 use Quazardous\GramPHP\Merge;
+use Quazardous\GramPHP\MigrationError;
 use Quazardous\GramPHP\Node;
 use Quazardous\GramPHP\NodeJournal;
 use Quazardous\GramPHP\Outcome;
@@ -1108,6 +1109,181 @@ abstract class JournalContract extends TestCase
         self::assertSame(['v1', 'v2'], $journal->refs($big, 'arrive'));
         self::assertSame(2, $this->letIn($journal, [$big, 7]));
         self::assertTaken([7, $big], $this->claim($journal, 'scrape', [$big, 7]));
+    }
+
+    // -- versions and migration ------------------------------------------
+
+    /** Another journal on the same storage, on another graph. */
+    private function journalOn(NodeJournal $journal, Graph $graph): NodeJournal
+    {
+        return new NodeJournal($journal->driver, $graph, $this->clock);
+    }
+
+    private static function v1(): Graph
+    {
+        return new Graph(new Document('line', '1'), new Dag(
+            new Node('fetch'),
+            new Node('crop', parents: ['fetch']),
+            new Node('thumb', parents: ['crop']),
+            new Node('publish', parents: ['thumb']),
+        ));
+    }
+
+    /** v2 inserts `watermark` between `thumb` and `publish`, renames `crop` to `trim`, and drops nothing. */
+    private static function v2(): Graph
+    {
+        return new Graph(new Document('line', '2'), new Dag(
+            new Node('fetch'),
+            new Node('trim', parents: ['fetch']),
+            new Node('thumb', parents: ['trim']),
+            new Node('watermark', parents: ['thumb']),
+            new Node('publish', parents: ['watermark']),
+        ));
+    }
+
+    /** Two workflows, not two versions of one: same version string, same node names. */
+    private static function named(string $name): Graph
+    {
+        return new Graph(new Document($name, '1'), new Dag(new Node('fetch'), new Node('publish', parents: ['fetch'])));
+    }
+
+    public function testSubjectsStayOnTheVersionTheyStartedOn(): void
+    {
+        $v1 = $this->journal(self::v1());
+        $v2 = $this->journalOn($v1, self::v2());
+        $this->work($v1, 'fetch', ['old']);
+        self::assertSame('default/line@1', $v1->pinned('old'));
+        self::assertTaken(['new'], $this->claim($v2, 'fetch', ['old', 'new']));
+        self::assertSame('default/line@2', $v2->pinned('new'));
+        self::assertTaken(['old'], $this->claim($v1, 'crop', ['old', 'new']), 'v1 never touches a subject of v2');
+    }
+
+    public function testTwoGraphsSharingAVersionStringStayStrangers(): void
+    {
+        $offers = $this->journal(self::named('offers'));
+        $invoices = $this->journalOn($offers, self::named('invoices'));
+        $this->work($offers, 'fetch', ['s1']);
+        self::assertSame('default/offers@1', $offers->pinned('s1'));
+        self::assertTaken([], $this->claim($invoices, 'fetch', ['s1']), 'a subject of offers is none of the business of invoices');
+        self::assertSame([], $invoices->progress('s1'), 'nor does it see its rows');
+        self::assertTaken(['s1'], $this->claim($offers, 'publish', ['s1']), 'and offers still owns it');
+    }
+
+    public function testProgressOfManySubjectsReadsAsProgressOfEach(): void
+    {
+        $v1 = $this->journal(self::v1());
+        $invoices = $this->journalOn($v1, self::named('invoices'));
+        $this->work($v1, 'fetch', ['s1', 's2']);
+        $this->work($v1, 'crop', ['s2']);
+        $this->work($invoices, 'fetch', ['theirs']);
+        $many = $v1->progressMany(['s1', 's2', 'never', 'theirs', 's1']);
+        self::assertSame(['s:s1', 's:s2', 's:never', 's:theirs'], array_keys($many), 'each once, in order');
+        self::assertSame([], $many['s:theirs']);
+        self::assertSame([], $many['s:never']);
+        self::assertEquals(['fetch' => Status::Done, 'crop' => Status::Done], $many['s:s2'], 'rows in no particular order');
+        self::assertEquals($v1->progress('s1'), $many['s:s1']);
+    }
+
+    public function testACompliantSubjectMigratesRenamedAndRepinned(): void
+    {
+        $v1 = $this->journal(self::v1());
+        $v2 = $this->journalOn($v1, self::v2());
+        foreach (['fetch', 'crop', 'thumb'] as $name) {
+            $this->work($v1, $name, ['s1']);
+        }
+        self::assertSame(1, $v2->migrate(['s1'], self::v1(), ['crop' => 'trim']));
+        self::assertSame('default/line@2', $v2->pinned('s1'));
+        self::assertProgress(['fetch' => Status::Done, 'trim' => Status::Done, 'thumb' => Status::Done], $v2, 's1');
+        self::assertTaken(['s1'], $this->claim($v2, 'watermark', ['s1']), 'the new node is next, as if the subject had started on v2');
+    }
+
+    public function testAMigrationSwappingTwoNodesMovesEveryRowOnce(): void
+    {
+        $nodes = new Dag(new Node('start'), new Node('a', parents: ['start']), new Node('b', parents: ['start']));
+        $before = new Graph(new Document('pair', '1'), $nodes);
+        $v1 = $this->journal($before);
+        $v2 = $this->journalOn($v1, new Graph(new Document('pair', '2'), $nodes));
+        $this->work($v1, 'start', ['s1', 's2', 's3']);
+        $this->work($v1, 'a', ['s1', 's2', 's3']);
+        $lease = $this->claim($v1, 'b', ['s2', 's3']);
+        $v1->fail('b', $lease, $lease->token);
+        self::assertSame(3, $v2->migrate(['s1', 's2', 's3'], $before, ['a' => 'b', 'b' => 'a']));
+        self::assertProgress(['start' => Status::Done, 'b' => Status::Done], $v2, 's1');
+        self::assertProgress(['start' => Status::Done, 'b' => Status::Done, 'a' => Status::Failed], $v2, 's2');
+        self::assertProgress(['start' => Status::Done, 'b' => Status::Done, 'a' => Status::Failed], $v2, 's3');
+    }
+
+    public function testMigrationIsAllOrNothing(): void
+    {
+        $v1 = $this->journal(self::v1());
+        $v2 = $this->journalOn($v1, self::v2());
+        foreach (['early', 'late'] as $subject) {
+            foreach (['fetch', 'crop', 'thumb'] as $name) {
+                $this->work($v1, $name, [$subject]);
+            }
+        }
+        $this->work($v1, 'publish', ['late']);
+        try {
+            $v2->migrate(['early', 'late'], self::v1(), ['crop' => 'trim']);
+            self::fail('late cannot move: publish would stand before watermark');
+        } catch (MigrationError $e) {
+            self::assertSame(['s:late'], array_keys($e->problems));
+            self::assertStringContainsString('publish', $e->problems['s:late']);
+        }
+        self::assertSame('default/line@1', $v2->pinned('early'), 'the compliant one did not move either');
+        self::assertSame(Status::Done, $v1->progress('early')['crop']);
+    }
+
+    public function testADroppedNodeIsArchivedUnlessSomeoneHoldsIt(): void
+    {
+        $v1 = $this->journal(self::v1());
+        $v3 = $this->journalOn($v1, new Graph(new Document('line', '3'), new Dag(
+            new Node('fetch'),
+            new Node('thumb', parents: ['fetch']),
+            new Node('publish', parents: ['thumb']),
+        )));
+        $this->work($v1, 'fetch', ['done', 'held']);
+        $this->work($v1, 'crop', ['done']);
+        $this->claim($v1, 'crop', ['held']);
+        self::assertThrows(static fn() => $v3->migrate(['done', 'held'], self::v1(), ['crop' => null]), MigrationError::class, 'held');
+        self::assertSame(1, $v3->migrate(['done'], self::v1(), ['crop' => null]));
+        self::assertProgress(['fetch' => Status::Done], $v3, 'done');
+        self::assertSame([['crop', 'migrate']], array_map(static fn(array $r): array => [$r['node'], $r['reason']], $v3->history('done')));
+    }
+
+    public function testAMappingThatCannotHoldIsRefused(): void
+    {
+        $v1 = $this->journal(self::v1());
+        $v2 = $this->journalOn($v1, self::v2());
+        self::assertThrows(static fn() => $v2->migrate(['s1'], self::v1()), \InvalidArgumentException::class, 'nowhere to go');
+        self::assertThrows(static fn() => $v2->migrate(['s1'], self::v1(), ['crop' => 'trim', 'fetch' => 'trim']), \InvalidArgumentException::class, 'same node');
+        self::assertThrows(static fn() => $v2->migrate(['s1'], self::v1(), ['ghost' => 'trim', 'crop' => 'trim']), \InvalidArgumentException::class, 'does not have');
+        self::assertThrows(static fn() => $v2->migrate(['s1'], self::v2()), \InvalidArgumentException::class, 'already');
+    }
+
+    public function testReleaseLeavesTheLeasesOfAnotherVersionAlone(): void
+    {
+        $v1 = $this->journal(self::v1());
+        $v2 = $this->journalOn($v1, self::v2());
+        self::assertTaken(['old'], $this->claim($v1, 'fetch', ['old']));
+        $this->clock->now = '2026-01-02T00:00:00+00:00';
+        self::assertSame(0, $v2->release('fetch', $this->clock->now), 'a journal on v2 does not hand back a v1 subject\'s lease');
+        self::assertSame(1, $v1->release('fetch', $this->clock->now));
+    }
+
+    public function testAMigrationCarriesTheArrivalsOfARenamedLane(): void
+    {
+        $v1 = new Graph(new Document('listings', '1'), Graphs::listing());
+        $old = $this->journal($v1);
+        $new = $this->journalOn($old, new Graph(new Document('listings', '2'), new Dag(
+            new Node('inbox', lane: Lane::throttle(cooldown: '1h')),
+            new Node('scrape', parents: ['inbox']),
+            new Node('publish', parents: ['scrape']),
+        )));
+        $old->arrive('arrive', ['s1'], 'v1');
+        self::assertSame(1, $new->migrate(['s1'], $v1, ['arrive' => 'inbox']));
+        self::assertSame('v1', $new->arrival('s1', 'inbox')?->ref);
+        self::assertSame(['inbox' => ['entered' => 1]], $new->settle($this->harness->candidates(['s1'])));
     }
 
     // -- policies --------------------------------------------------------

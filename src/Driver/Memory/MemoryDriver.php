@@ -10,6 +10,7 @@ use Quazardous\GramPHP\Driver\LaneDriver;
 use Quazardous\GramPHP\Driver\LimitDriver;
 use Quazardous\GramPHP\Driver\NodeTimes;
 use Quazardous\GramPHP\Driver\ReadingDriver;
+use Quazardous\GramPHP\Driver\VersionDriver;
 use Quazardous\GramPHP\Entry;
 use Quazardous\GramPHP\Keyed;
 use Quazardous\GramPHP\Merge;
@@ -31,7 +32,7 @@ use Quazardous\GramPHP\Time;
  * `candidates` is an ordered iterable of subjects (or `Keyed`): the order is
  * the priority, the first ones are taken first.
  */
-final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDriver, LimitDriver
+final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDriver, LimitDriver, VersionDriver
 {
     /** @var array<string, array<string, Row>> Subject::key() => node => row, in the order written */
     private array $rows = [];
@@ -50,6 +51,9 @@ final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDr
 
     /** @var array<string, float> limiter state */
     private array $limits = [];
+
+    /** @var array<string, string> Subject::key() => the graph it is pinned to */
+    private array $versionOf = [];
 
     public function now(): string
     {
@@ -162,6 +166,10 @@ final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDr
         foreach ($this->rows as $key => $nodes) {
             $row = $nodes[$name] ?? null;
             if (null === $row || Status::Running->value !== $row->status || strcmp($row->startedAt, $olderThan) >= 0) {
+                continue;
+            }
+            $pinned = $this->versionOf[$key] ?? null;
+            if (null !== $version && null !== $pinned && $pinned !== $version) {
                 continue;
             }
             $policy = $this->policyOf[$key] ?? null;
@@ -280,6 +288,57 @@ final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDr
     public function progress(int|string $subject): array
     {
         return array_map(static fn(Row $row): string => $row->status, $this->rows[Subject::key($subject)] ?? []);
+    }
+
+    // -- versions --------------------------------------------------------
+
+    public function pin(array $subjects, string $version): int
+    {
+        $count = 0;
+        foreach ($subjects as $subject) {
+            $key = Subject::key($subject);
+            if (!isset($this->versionOf[$key])) {
+                $this->versionOf[$key] = $version;
+                ++$count;
+            }
+        }
+
+        return $count;
+    }
+
+    public function versions(array $subjects): array
+    {
+        return array_intersect_key($this->versionOf, array_flip(array_map(Subject::key(...), $subjects)));
+    }
+
+    public function rewrite(int|string $subject, array $rename, array $drop, string $version, string $now): void
+    {
+        $key = Subject::key($subject);
+        foreach ($drop as $name) {
+            $this->takeAway($key, $name, $now, Reason::Migrate->value);
+            unset($this->waiting[$key][$name]);
+        }
+        // All the old names out first, then in under the new ones: a swap
+        // (a => b, b => a) moves every row once.
+        $rows = $arrivals = [];
+        foreach ($rename as $old => $new) {
+            if (isset($this->rows[$key][$old])) {
+                $rows[$new] = $this->rows[$key][$old];
+                unset($this->rows[$key][$old]);
+            }
+            if (isset($this->waiting[$key][$old])) {
+                $arrivals[$new] = $this->waiting[$key][$old];
+                unset($this->waiting[$key][$old]);
+            }
+        }
+        foreach ($rows as $new => $row) {
+            $this->rows[$key][$new] = $row;
+        }
+        foreach ($arrivals as $new => $arrival) {
+            $this->waiting[$key][$new] = $arrival;
+        }
+        $this->versionOf[$key] = $version;
+        $this->revisions[$key] = ($this->revisions[$key] ?? 0) + 1;
     }
 
     // -- limits ----------------------------------------------------------
@@ -493,7 +552,7 @@ final class MemoryDriver implements CoreDriver, ReadingDriver, NodeTimes, LaneDr
             }
         }
 
-        return new Entry($subject, $this->revisions[$key] ?? 0, $rows, $due, $finished, $this->policyOf[$key] ?? null, null, $groupKey);
+        return new Entry($subject, $this->revisions[$key] ?? 0, $rows, $due, $finished, $this->policyOf[$key] ?? null, $this->versionOf[$key] ?? null, $groupKey);
     }
 
     /** @return array{0: int|string, 1: ?string} */

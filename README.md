@@ -123,6 +123,23 @@ checked under every policy. Each subject is read through its own: its
 retries, its lease (`expire`), its timeout and grace (`settle`), its budget
 and its lane.
 
+## Versions: a graph that changes under subjects in flight
+
+A journal built on a `Graph` pins each subject, on its first write, to the
+graph it started on — the whole `Document::identity()`, `namespace/name@version`.
+It never touches a subject pinned elsewhere: version 1 finishes its subjects
+while version 2 takes the new ones. To move subjects across, on purpose:
+
+```php
+$v2 = new NodeJournal($driver, $graphV2);
+$v2->migrate($subjects, $graphV1, ['crop' => 'trim', 'legacy' => null]);   // renamed, dropped
+```
+
+A subject moves only if its journal could have been written on the new graph
+(every row's parents joined there), and never while a dropped node is held.
+All or nothing: one non-compliant subject raises `MigrationError`, naming each
+one and why, and nothing moves. Dropped rows go to the history.
+
 ## Limits and groups
 
 What a node uses is protected where the claim is decided:
@@ -234,13 +251,12 @@ could take now) and `oldest_ready` (starvation).
 Ported so far: the graph and its claim rule, joins (`on`, `need`), choices,
 loops, retries, leases, waits and signals, grace, skip, adopt, forget,
 release, the history, counts, stages and snapshots, rate limits,
-concurrency caps and groups, policies, lanes (throttle, debounce, dedupe, batch, merge
+concurrency caps and groups, policies, versions and migration, lanes (throttle, debounce, dedupe, batch, merge
 functions) and the items layer — with the
 memory and MariaDB drivers, both certified by the shared contract,
 concurrency included.
 
-Still to port from grampy: graph versions and migration, and the diagram
-(with the graph's JSON form).
+Still to port from grampy: the diagram, with the graph's JSON form.
 
 ## Development
 
