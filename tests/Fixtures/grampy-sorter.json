@@ -1,0 +1,96 @@
+{
+  "document": {
+    "dsl": "grampy/1",
+    "namespace": "demo",
+    "name": "brick-sorter",
+    "version": "2"
+  },
+  "nodes": {
+    "scan": {
+      "working": "scanning",
+      "state": "scanned",
+      "lease": "1m",
+      "choice": true
+    },
+    "colour": {
+      "parents": [
+        "scan"
+      ],
+      "rate": [
+        {
+          "limit": 10,
+          "period": "1m",
+          "burst": 2
+        }
+      ],
+      "concurrency": 3,
+      "per": "policy"
+    },
+    "quarantine": {
+      "parents": [
+        "scan"
+      ],
+      "wait": "deminer.called",
+      "timeout": "1h"
+    },
+    "defuse": {
+      "parents": [
+        "quarantine"
+      ],
+      "retry": {
+        "limit": 3,
+        "delay": "10s",
+        "backoff": "exponential",
+        "max_delay": "5m",
+        "jitter": 0.1
+      }
+    },
+    "reject": {
+      "parents": [
+        "defuse"
+      ],
+      "on": {
+        "defuse": [
+          "failed"
+        ]
+      }
+    },
+    "check": {
+      "parents": [
+        "colour"
+      ],
+      "loop": {
+        "to": "colour",
+        "max": 2,
+        "on": [
+          "failed"
+        ]
+      },
+      "grace": "5m",
+      "optional": true
+    },
+    "pack": {
+      "parents": [
+        "colour",
+        "defuse",
+        "check"
+      ],
+      "need": 2,
+      "once": true
+    }
+  },
+  "policies": {
+    "supplier-b": {
+      "defuse": {
+        "retry": {
+          "limit": 5,
+          "delay": 0,
+          "backoff": "exponential"
+        }
+      },
+      "colour": {
+        "concurrency": 1
+      }
+    }
+  }
+}

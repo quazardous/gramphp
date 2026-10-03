@@ -239,6 +239,26 @@ up (concluded `skipped`) for the items it is not for; `branch()` names the
 way out of a choice. The layer translates and stops there: everything it
 does is a call the id-based API could have made by hand.
 
+## The graph as data, and drawn
+
+A graph has one canonical form — grampy's format (`grampy/1`), so the same
+file is read and written by the Python and the PHP implementations alike:
+
+```php
+file_put_contents('offers.graph.json', $graph->toJson());   // only what differs from a default
+$graph = Graph::fromJson(file_get_contents('offers.graph.json'));   // strict: a lie is refused with its path
+```
+
+And drawn, every mechanism with a shape of its own, counts overlaid if given:
+
+```php
+use Quazardous\GramPHP\Diagram;
+
+echo Diagram::mermaid($graph, Diagram::overlay($journal));   // flowchart, ▶ running ✓ done …
+echo Diagram::stateDiagram($graph);                          // the statechart reading
+echo Diagram::dot($graph);                                   // Graphviz
+```
+
 ## Monitoring
 
 `$journal->snapshot($candidates)` gives, per node, plain numbers to sample
@@ -248,15 +268,17 @@ could take now) and `oldest_ready` (starvation).
 
 ## Status of the port
 
-Ported so far: the graph and its claim rule, joins (`on`, `need`), choices,
-loops, retries, leases, waits and signals, grace, skip, adopt, forget,
-release, the history, counts, stages and snapshots, rate limits,
-concurrency caps and groups, policies, versions and migration, lanes (throttle, debounce, dedupe, batch, merge
-functions) and the items layer — with the
-memory and MariaDB drivers, both certified by the shared contract,
-concurrency included.
+Ported: the graph and its claim rule, joins (`on`, `need`), choices, loops,
+retries, leases, waits and signals, grace, skip, adopt, forget, release, the
+history, counts, stages and snapshots, rate limits, concurrency caps and
+groups, policies, versions and migration, lanes (throttle, debounce, dedupe,
+batch, merge functions), the items layer, the graph's JSON form and the
+diagrams — with the memory and MariaDB drivers, both certified by the shared
+contract, concurrency included.
 
-Still to port from grampy: the diagram, with the graph's JSON form.
+Every mechanism grampy's graph declares runs here. Not ported: grampy's
+SQLite and PostgreSQL drivers, and the optional one-statement fast paths a
+driver may offer (`skip_where`, `ready_count`).
 
 ## Development
 

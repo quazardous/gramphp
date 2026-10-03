@@ -1,0 +1,31 @@
+{
+  "document": {
+    "dsl": "grampy/1",
+    "namespace": "default",
+    "name": "listings",
+    "version": "0"
+  },
+  "nodes": {
+    "in": {
+      "lane": {
+        "position": "last",
+        "delay": "5m",
+        "max_wait": "1h"
+      }
+    },
+    "work": {
+      "parents": [
+        "in"
+      ]
+    }
+  },
+  "policies": {
+    "slow": {
+      "in": {
+        "lane": {
+          "cooldown": "1d"
+        }
+      }
+    }
+  }
+}

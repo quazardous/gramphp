@@ -70,6 +70,32 @@ final class Graph
         return null === $policy ? $this->dag : ($this->variants[$policy] ?? $this->dag);
     }
 
+    /**
+     * The canonical form — see `GraphFormat`.
+     *
+     * @return array<string, mixed>
+     */
+    public function toArray(): array
+    {
+        return GraphFormat::write($this);
+    }
+
+    public function toJson(): string
+    {
+        return GraphFormat::toJson($this);
+    }
+
+    /** A graph from its canonical form, read strictly — see `GraphFormat`. */
+    public static function fromArray(mixed $data): self
+    {
+        return GraphFormat::read($data);
+    }
+
+    public static function fromJson(string $text): self
+    {
+        return GraphFormat::fromJson($text);
+    }
+
     /** True when some policy changes `setting` on the node `name`. */
     public function overrides(string $name, string $setting): bool
     {

@@ -24,6 +24,13 @@ follows [Semantic Versioning](https://semver.org/).
 - The MariaDB driver runs over PDO or over a Doctrine DBAL connection
   (`DbalSql`), so a Symfony application can share its own connection and
   transaction; the contract runs on both.
+- The graph as data: `Graph::toArray()` / `toJson()` write one canonical
+  form, grampy's own (`grampy/1`, the same file in either implementation);
+  `fromArray()` / `fromJson()` read it strictly, a lie refused with its path
+  (`GraphFormatError`). Groups are written too, which grampy does not read yet.
+- `Diagram`: Mermaid flowchart, Mermaid state diagram and Graphviz drawings
+  of a graph, every mechanism with a shape, journal counts overlaid
+  (`Diagram::overlay()`).
 - Versions (`VersionDriver`): a journal on a `Graph` pins each subject to
   its `Document::identity()` on its first write and never touches a subject
   pinned elsewhere; `pinned()`; `migrate()` moves subjects to another version,
