@@ -100,6 +100,49 @@ A transaction mixing several claims and forgets on the same subjects can
 meet a deadlock: InnoDB reports it (error 1213, SQLSTATE 40001), rolls the
 transaction back, and the caller retries it — nothing is ever half-written.
 
+## Items: speak objects, not ids
+
+The core works on ids and knows nothing about your data. The optional items
+layer holds the handlers that read your own objects and turns their answers
+into calls the journal already understands:
+
+```php
+use Quazardous\GramPHP\Items\Adapter;
+use Quazardous\GramPHP\Items\Items;
+
+final class Orders extends Adapter
+{
+    public function idOf(mixed $candidate): int|string
+    {
+        return $candidate instanceof Order ? $candidate->id : $candidate;
+    }
+
+    public function inflate(array $candidates): iterable   // ids in, orders out, in one call
+    {
+        $ids = array_filter($candidates, is_int(...));
+        return [...array_diff_key($candidates, $ids), ...$this->repository->findByIds($ids)];
+    }
+
+    public function policyOf(mixed $order): ?string { return $order->plan; }
+    public function branch(mixed $order, string $node): ?string { return $order->digital ? 'mail' : 'ship'; }
+    public function applies(mixed $order, string $node): bool { return 'gift-wrap' !== $node || $order->gift; }
+}
+
+$items = new Items($journal, new Orders($repository));
+$lease = $items->claim('pay', 10, $orders);      // your objects in — or ids, or a Query
+foreach ($lease as $order) {                     // your objects out
+    // …
+}
+$items->conclude('pay', $lease);                 // the token travels with the lease
+```
+
+Objects handed in travel with the claim and are never loaded twice; ids —
+and a driver's `Query` — are loaded with `inflate`, once per call, and an id
+nothing loads lands in `$lease->missing`. `applies()` gives an optional node
+up (concluded `skipped`) for the items it is not for; `branch()` names the
+way out of a choice. The layer translates and stops there: everything it
+does is a call the id-based API could have made by hand.
+
 ## Monitoring
 
 `$journal->snapshot($candidates)` gives, per node, plain numbers to sample
@@ -111,12 +154,14 @@ could take now) and `oldest_ready` (starvation).
 
 Ported so far: the graph and its claim rule, joins (`on`, `need`), choices,
 loops, retries, leases, waits and signals, grace, skip, adopt, forget,
-release, the history, counts, stages and snapshots — with the memory and
-MariaDB drivers, both certified by the shared contract, concurrency included.
+release, the history, counts, stages and snapshots, and the items layer —
+with the memory and MariaDB drivers, both certified by the shared contract,
+concurrency included.
 
 Still to port from grampy: groups, rate limits and concurrency caps,
 policies, lanes (throttle, debounce, dedupe, batch), graph versions and
-migration, the items layer, and the diagram.
+migration, and the diagram. The items layer gains `arrive` / `refOf` with
+lanes and `groupOf` with groups.
 
 ## Development
 

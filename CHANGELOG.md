@@ -24,3 +24,7 @@ follows [Semantic Versioning](https://semver.org/).
 - The MariaDB driver runs over PDO or over a Doctrine DBAL connection
   (`DbalSql`), so a Symfony application can share its own connection and
   transaction; the contract runs on both.
+- The items layer (`Items\Items`, `Items\Adapter`, `Items\ItemLease`):
+  claim, conclude and pass-through calls in the application's own objects;
+  ids and a driver's `Query` are loaded with `inflate`, once per call;
+  `applies` gives an optional node up, `branch` names a choice's way out.
