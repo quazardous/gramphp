@@ -1,5 +1,9 @@
 # gramphp
 
+[![CI](https://github.com/quazardous/gramphp/actions/workflows/ci.yml/badge.svg)](https://github.com/quazardous/gramphp/actions/workflows/ci.yml)
+[![Packagist](https://img.shields.io/packagist/v/quazardous/gramphp)](https://packagist.org/packages/quazardous/gramphp)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A small workflow graph for work queues that already live in a storage — a
 database, or plain memory: the storage is a driver.
 
@@ -8,6 +12,9 @@ A PHP port of [grampy](https://github.com/quazardous/grampy).
 ```bash
 composer require quazardous/gramphp
 ```
+
+PHP 8.2 or later. The MariaDB driver needs `ext-pdo_mysql`, or `doctrine/dbal` 4
+to share a Doctrine connection.
 
 You declare a DAG of nodes. Each *subject* (a job, an order, a feed…) goes
 through the nodes; a **node journal** records, per subject and per node,

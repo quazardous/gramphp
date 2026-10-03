@@ -6,6 +6,10 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-03
+
+The first release: the whole workflow model of grampy, in PHP.
+
 ### Added
 
 - The graph (`Dag`, `Node`) and its pure claim rule: parents concluded,
@@ -61,3 +65,6 @@ follows [Semantic Versioning](https://semver.org/).
   ids and a driver's `Query` are loaded with `inflate`, once per call;
   `applies` gives an optional node up, `branch` names a choice's way out;
   `arrive` sends items into a lane with their `refOf`.
+
+[Unreleased]: https://github.com/quazardous/gramphp/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/quazardous/gramphp/releases/tag/v0.1.0
